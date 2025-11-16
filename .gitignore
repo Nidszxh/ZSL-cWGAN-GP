@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+*.egg-info/
+
+# Data
+data/CIFAR-100/
+*.npy
+*.pkl
+
+# Outputs (optional - you might want to track some)
+cache/
+checkpoints/
+results/
+logs/
+*.pth
+*.png
+*.jpg
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Large files
+glove.6B.zip
+*.zip
