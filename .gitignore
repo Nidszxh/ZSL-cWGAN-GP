@@ -9,7 +9,7 @@ venv/
 *.egg-info/
 
 # Data
-data/CIFAR-100/
+data/
 *.npy
 *.pkl
 

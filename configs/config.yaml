@@ -1,0 +1,95 @@
+# Experiment
+experiment:
+  name: "zsl-cwgan-gp"
+  seed: 42
+  device: "cuda"  # Options: "cuda", "cpu"
+
+# Paths
+paths:
+  data_root: "./data"
+  results_dir: "./results"
+  checkpoints_dir: "./checkpoints"
+  cache_dir: "./cache"
+  tensorboard_dir: "./runs"
+
+# Dataset
+dataset:
+  name: "CIFAR100"
+  num_classes: 100
+  seen_classes: 80
+  unseen_classes: 20
+  image_size: 32
+  num_workers: 4
+
+# Semantic Embeddings (NEW - Day 1)
+embeddings:
+  type: "clip"  # Options: "clip", "glove", "both"
+  clip_model: "openai/clip-vit-base-patch32"  # CLIP model to use
+  clip_cache_dir: "./cache/clip"
+  embedding_dim: 512  # CLIP text embedding dimension (512 for ViT-B/32)
+  normalize: true  # Normalize embeddings
+  
+  # GloVe (legacy, for comparison)
+  glove_path: "glove.6B.300d.txt"
+  glove_dim: 300
+
+# Model Architecture
+model:
+  # Generator
+  generator:
+    nz: 128  # Latent dimension
+    ngf: 64  # Base channel multiplier
+    nc: 3    # Image channels
+    semantic_proj_dim: 256  # Projection dimension for semantic features
+    dropout: 0.2
+  
+  # Discriminator
+  discriminator:
+    ndf: 64  # Base channel multiplier
+    nc: 3
+    semantic_proj_dim: 256
+
+training:
+  # Basic
+  num_epochs: 50
+  batch_size: 128  # Adjust based on GPU memory
+  
+  # Optimization
+  lr_g: 0.0001
+  lr_d: 0.0004
+  beta1: 0.0
+  beta2: 0.9
+  
+  # WGAN-GP
+  lambda_gp: 10
+  n_critic: 5
+  grad_clip: 1.0
+  
+  # Scheduler
+  lr_decay: 0.99  # Exponential decay
+  
+  # Checkpointing
+  save_interval: 10
+  eval_interval: 5
+  
+  early_stopping_patience: 15
+
+evaluation:
+  # GAN Metrics
+  fid_samples: 50000  # Number of samples for FID calculation
+  calculate_is: true
+  calculate_kid: true
+  
+  # ZSL Metrics
+  synthetic_samples_per_class: 500
+  zsl_epochs: 30
+  zsl_lr: 0.001
+  zsl_batch_size: 64
+
+logging:
+  use_tensorboard: true
+  use_wandb: false               # Set true if using W&B
+  wandb_project: "zsl-cwgan-gp"
+  wandb_entity: null             # Your W&B username
+  log_interval: 50               # Log every N iterations
+  save_samples: true
