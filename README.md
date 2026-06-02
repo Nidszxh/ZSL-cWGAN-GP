@@ -1,145 +1,209 @@
 # Zero-Shot Learning with Conditional WGAN-GP (ZSL-cWGAN-GP)
 
-A PyTorch implementation of **Zero-Shot Learning (ZSL)** using a **Conditional Wasserstein GAN with Gradient Penalty (cWGAN-GP)**.  
-This project learns to generate realistic images for unseen classes by combining **semantic word embeddings (GloVe)** with adversarial image synthesis on **CIFAR-100**.
+A PyTorch implementation of **Zero-Shot Learning (ZSL)** using a **Conditional Wasserstein GAN with Gradient Penalty (cWGAN-GP)** on **CIFAR-100** with CLIP text embeddings.
+
+The model learns to generate realistic images for **unseen classes** by conditioning a WGAN-GP on **semantic embeddings** (CLIP text embeddings or GloVe). A classifier trained on these synthetic samples can then recognize categories it was never trained on.
 
 ---
 
-## Overview
+## Key Features
 
-This project tackles **Zero-Shot Learning**, where a model must recognize categories it has never seen before.  
-By conditioning a **Wasserstein GAN** on **semantic embeddings**, it can generate synthetic samples for *unseen classes*, which are then used to train a classifier.
-
-### Key Features
-- **Semantic Conditioning:** Uses GloVe embeddings to integrate semantic meaning into generation.  
-- **Conditional WGAN-GP:** Stable training with gradient penalty and spectral normalization.  
-- **Zero-Shot Classifier:** Trains a classifier on generated unseen data.  
-- **FID Evaluation:** Computes Fréchet Inception Distance to monitor realism.  
-- **Automatic Visualization:** Saves grids, FID curves, confusion matrices, and summary images.  
+- **Semantic Conditioning:** CLIP text embeddings (512-dim) or GloVe (300-dim)
+- **Conditional WGAN-GP:** Stable training with gradient penalty and spectral normalization
+- **Zero-Shot Classifier:** Trained on synthetically generated unseen-class images
+- **FID / IS / KID Evaluation:** Monitors generation quality during training
+- **Interactive Demo:** Gradio web interface for ZSL predictions
+- **TensorBoard Logging:** Loss curves, metrics, and generated samples
 
 ---
 
 ## Installation
 
-### Requirements
-Ensure Python ≥ 3.9 and the following dependencies:
-
 ```bash
-pip install torch torchvision numpy matplotlib tqdm requests torch-fidelity
+pip install -r requirements.txt
 ```
 
-> 💡 GPU is strongly recommended for training.
+> **GPU is strongly recommended** — CPU training will be extremely slow.
 
 ---
 
-## ⚙️ Configuration
+## Quick Start
 
-All hyperparameters are defined in the `config` dictionary:
-
-```python
-config = {
-    'batch_size': 64,
-    'nz': 128,
-    'ngf': 64,
-    'ndf': 64,
-    'num_classes': 100,
-    'lr_g': 0.0001,
-    'lr_d': 0.0002,
-    'lambda_gp': 10,
-    'n_critic': 5,
-    'embedding_dim': 300,
-    'semantic_proj_dim': 256
-}
+### Train (CLIP-based, 150 epochs)
+```bash
+python main.py
 ```
 
-Modify as needed before running.
+### View training curves
+```bash
+tensorboard --logdir=runs
+```
+
+### Launch interactive demo
+```bash
+python app.py
+```
+
+### Quick sanity check (5 epochs)
+```bash
+python test_training.py
+```
 
 ---
 
 ## Usage
 
-### Run Training
-```bash
-python ZSLcWGAN-GP.py
+### Full Training Pipeline
+
+`python main.py` drives the modular pipeline:
+
+1. Reads `configs/config.yaml`
+2. Downloads CIFAR-100 and CLIP model (on first run)
+3. Splits 100 classes into 80 seen / 20 unseen (cached)
+4. Trains the conditional WGAN-GP with periodic FID evaluation
+5. Generates synthetic images for unseen classes
+6. Trains and evaluates a Zero-Shot classifier
+7. Saves visualizations and experiment summary
+
+**Config** is controlled via `configs/config.yaml`:
+```yaml
+embeddings:
+  type: "clip"                        # "clip" (512d) or "glove" (300d)
+training:
+  num_epochs: 150                     # Total training epochs
+  batch_size: 128                     # 128 fits 8GB VRAM (501 img/s)
+  lr_g: 0.0001
+  lr_d: 0.0001
+  eval_interval: 10                   # FID evaluation every N epochs
+  early_stopping_patience: 20
+  n_critic: 5                         # D updates per G update
+  lambda_gp: 10                       # Gradient penalty coefficient
 ```
 
-This will:
-- Download CIFAR-100 and GloVe (if missing)
-- Train on 80 seen classes
-- Compute FID periodically
-- Save checkpoints and sample outputs automatically
+### Quick Test
+```bash
+python test_training.py     # 5-epoch CLIP test
+```
 
-### Evaluate
-After training, the script:
-- Loads the best checkpoint (lowest FID)
-- Generates unseen class images
-- Evaluates a Zero-Shot classifier
-- Saves results under `results/`
+### CLIP Embedding Tests
+```bash
+python test_clip.py         # validates CLIP integration
+```
+
+### Legacy GloVe Training
+```bash
+python ZSLcWGAN-GP.py       # original monolithic script
+```
+
+### Interactive Demo
+After training, launch the Gradio demo:
+```bash
+python app.py
+```
+
+Upload an image from one of the 20 unseen CIFAR-100 classes and get top-5 ZSL predictions.
 
 ---
 
 ## Project Structure
 
 ```
-ZSLcWGAN-GP/
-├── ZSLcWGAN-GP.py              # Main script
-├── data/                       # CIFAR-100 dataset (auto-downloaded)
-├── checkpoints/                # Saved model weights
-├── results/
-│   ├── fake/                   # Generated fake samples
-│   ├── real/                   # Real samples for FID
-│   ├── unseen_synthetic/       # Unseen class generations
-│   ├── fid_progress.png        # FID curve
-│   ├── training_curves.png     # G/D losses
-│   ├── zsl_class_accuracy.png  # Class-level ZSL accuracy
-│   └── exp_summary.png         # Summary visualization
-└── glove.6B.300d.txt           # GloVe embeddings
+ZSL-cWGAN-GP/
+├── main.py                  # Unified entrypoint (CLIP pipeline)
+├── app.py                   # Gradio demo
+├── ZSLcWGAN-GP.py           # Legacy monolithic script (GloVe)
+├── test_training.py         # Quick 5-epoch sanity check
+├── test_clip.py             # CLIP embedding tests
+├── configs/
+│   └── config.yaml          # All hyperparameters
+├── models/
+│   ├── generator.py         # Conditional generator
+│   ├── discriminator.py     # Projection discriminator
+│   └── zsl_classifier.py    # ZSL classifier
+├── training/
+│   ├── trainer.py           # Training loop
+│   └── losses.py            # WGAN-GP loss functions
+├── evaluation/
+│   ├── gan_eval.py          # FID / IS / KID evaluation
+│   └── zsl_eval.py          # ZSL classifier training & eval
+├── utils/
+│   ├── embeddings.py        # CLIP + GloVe embedders
+│   ├── data_loader.py       # CIFAR-100 with seen/unseen split
+│   ├── metrics.py           # Metrics tracker
+│   └── visualization.py     # Plotting utilities
+├── data/                    # CIFAR-100 (auto-downloaded)
+├── cache/                   # Embedding cache, class split
+├── checkpoints/             # Saved model weights
+├── results/                 # Output images, plots, logs
+│   ├── fake/                # Generated samples for FID
+│   ├── real/                # Real samples for FID
+│   ├── unseen_synthetic/    # Unseen class generations
+│   └── ...
+└── runs/                    # TensorBoard logs
 ```
 
 ---
 
 ## Outputs
 
-After execution, results are saved in `results/`:
+After training, results are saved under `results/`:
 
-- **Generated Samples:** `generated_samples_grid.png`  
-- **FID Curve:** `fid_progress.png`  
-- **Zero-Shot Class Accuracy:** `zsl_class_accuracy.png`  
-- **Confusion Matrix:** `zsl_confusion_matrix.png`  
-- **Experiment Summary:** `exp_summary.png`  
+| File | Description |
+|---|---|
+| `training_curves.png` | Generator/discriminator loss curves |
+| `metrics_progress.png` | FID and Inception Score over epochs |
+| `generated_samples_grid.png` | Grid of generated seen-class images |
+| `zsl_confusion_matrix.png` | Confusion matrix on unseen classes |
+| `zsl_class_accuracy.png` | Per-class ZSL accuracy |
+| `experiment_summary.png` | Combined summary visualization |
 
 Sample console output:
 ```
-Epoch 5/10 - FID: 45.12 ✓ New best FID: 45.12
-Epoch 10/10 - FID: 42.88 × FID did not improve
-Final FID: 42.15
-ZSL Accuracy: 37.64%
+Epoch 10/150 - FID: 87.84 ✓ New best FID: 87.84
+Epoch 20/150 - FID: 72.54 ✓ New best FID: 72.54
+...
+Epoch 50/150 - FID: 58.84 ✓ New best FID: 58.84
+ZSL Top-1 Accuracy: 4.45%
 ```
 
 ---
 
-## Evaluate Separately
+## Configuration Reference
 
-If you want to re-run ZSL evaluation:
+Key settings in `configs/config.yaml`:
 
-```python
-from ZSLcWGAN_GP import evaluate_zsl_performance
-metrics = evaluate_zsl_performance()
-print(metrics["accuracy"])
-```
+| Key | Default | Description |
+|---|---|---|
+| `embeddings.type` | `"clip"` | `"clip"`, `"glove"`, or `"both"` |
+| `training.num_epochs` | `150` | Total training epochs |
+| `training.batch_size` | `128` | Batch size (benchmarked up to 160 on 8GB) |
+| `training.lr_g` | `0.0001` | Generator learning rate |
+| `training.lr_d` | `0.0001` | Discriminator learning rate |
+| `training.n_critic` | `5` | D updates per G update |
+| `training.lambda_gp` | `10` | Gradient penalty coefficient |
+| `training.eval_interval` | `10` | FID eval frequency (epochs) |
+| `training.early_stopping_patience` | `20` | Patience before early stop |
+| `evaluation.fid_samples` | `20000` | Samples for FID calculation |
+| `evaluation.synthetic_samples_per_class` | `2000` | Synthetic images per unseen class |
+
+---
+
+## Auto-Downloads
+
+- **CIFAR-100** — via `torchvision.datasets`
+- **CLIP model** — `openai/clip-vit-base-patch32` via HuggingFace `transformers`
+- **GloVe 6B 300d** — ~822MB zip from Stanford (only when using GloVe)
 
 ---
 
 ## License
 
-This project is licensed under the **MIT License** — you are free to use, modify, and distribute it with attribution.
-
----
+MIT
 
 ## Acknowledgments
 
 - [PyTorch](https://pytorch.org/)
-- [Stanford GloVe Embeddings](https://nlp.stanford.edu/projects/glove/)
-- [CIFAR-100 Dataset](https://www.cs.toronto.edu/~kriz/cifar.html)
-- [Torch-Fidelity for FID computation](https://github.com/toshas/torch-fidelity)
-
+- [OpenAI CLIP](https://github.com/openai/CLIP)
+- [Stanford GloVe](https://nlp.stanford.edu/projects/glove/)
+- [CIFAR-100](https://www.cs.toronto.edu/~kriz/cifar.html)
+- [Torch-Fidelity](https://github.com/toshas/torch-fidelity)

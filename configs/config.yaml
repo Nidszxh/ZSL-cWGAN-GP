@@ -19,7 +19,7 @@ dataset:
   seen_classes: 80
   unseen_classes: 20
   image_size: 32
-  num_workers: 4
+  num_workers: 2
 
 # Semantic Embeddings (NEW - Day 1)
 embeddings:
@@ -51,40 +51,41 @@ model:
 
 training:
   # Basic
-  num_epochs: 50
-  batch_size: 128  # Adjust based on GPU memory
-  
+  num_epochs: 150
+  batch_size: 128
+  mixed_precision: true               # FP16 for ~2x speedup on Tensor Cores
+
   # Optimization
   lr_g: 0.0001
-  lr_d: 0.0004
+  lr_d: 0.0001
   beta1: 0.0
   beta2: 0.9
-  
+
   # WGAN-GP
   lambda_gp: 10
   n_critic: 5
   grad_clip: 1.0
-  
+
   # Scheduler
-  lr_decay: 0.99  # Exponential decay
-  
+  lr_decay: 0.995  # Exponential decay
+
   # Checkpointing
   save_interval: 10
-  eval_interval: 5
-  
-  early_stopping_patience: 15
+  eval_interval: 10
+
+  early_stopping_patience: 20
 
 evaluation:
   # GAN Metrics
-  fid_samples: 50000  # Number of samples for FID calculation
+  fid_samples: 20000  # Number of samples for FID calculation
   calculate_is: true
   calculate_kid: true
   
   # ZSL Metrics
-  synthetic_samples_per_class: 500
-  zsl_epochs: 30
+  synthetic_samples_per_class: 2000
+  zsl_epochs: 50
   zsl_lr: 0.001
-  zsl_batch_size: 64
+  zsl_batch_size: 128
 
 logging:
   use_tensorboard: true
