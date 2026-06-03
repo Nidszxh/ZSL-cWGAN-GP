@@ -68,7 +68,10 @@ class Discriminator(nn.Module):
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
 
-    def forward(self, x, labels, semantic_embeddings):
+    def forward_features(self, x):
+        return self.features(x)
+
+    def forward(self, x, labels, semantic_embeddings, return_features=False):
         h = self.features(x)  # [B, ndf*8, 4, 4]
 
         # Unconditional output
@@ -80,6 +83,8 @@ class Discriminator(nn.Module):
         h_pooled = F.adaptive_avg_pool2d(h, 1).view(-1, self.ndf * 8)
         cond_output = torch.sum(projection.squeeze() * h_pooled, dim=1)
 
+        if return_features:
+            return output + cond_output, h
         return output + cond_output
 
 

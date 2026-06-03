@@ -42,9 +42,18 @@ class WGANGPLoss:
         d_loss = d_loss_wgan + gp
         return {"d_loss": d_loss, "wasserstein_distance": w_dist.item(), "gradient_penalty": gp.item() / self.lambda_gp}
 
-    def generator_loss(self, discriminator: nn.Module, fake_images: torch.Tensor, labels: torch.Tensor, semantic_embeddings: torch.Tensor) -> dict:
+    def generator_loss(self, discriminator: nn.Module, fake_images: torch.Tensor, labels: torch.Tensor, semantic_embeddings: torch.Tensor, real_images: torch.Tensor = None, feature_matching_weight: float = 0.0) -> dict:
         fake_output = discriminator(fake_images, labels, semantic_embeddings)
         g_loss = wasserstein_loss_generator(fake_output)
+
+        if feature_matching_weight > 0 and real_images is not None:
+            # Compute discriminator features for real and fake
+            _, real_features = discriminator(real_images, labels, semantic_embeddings, return_features=True)
+            _, fake_features = discriminator(fake_images, labels, semantic_embeddings, return_features=True)
+            # L2 feature matching loss
+            fm_loss = (real_features - fake_features).pow(2).mean()
+            g_loss = g_loss + feature_matching_weight * fm_loss
+
         return {"g_loss": g_loss}
 
 

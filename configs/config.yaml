@@ -65,6 +65,7 @@ training:
   lambda_gp: 10
   n_critic: 5
   grad_clip: 1.0
+  feature_matching_weight: 0.0  # Discriminator feature matching loss (0 = disabled)
 
   # Scheduler
   lr_decay: 0.995  # Exponential decay
@@ -86,6 +87,9 @@ evaluation:
   zsl_epochs: 50
   zsl_lr: 0.001
   zsl_batch_size: 128
+  zsl_regenerate_every: 1       # Regenerate synthetic data every N ZSL epochs (1 = every epoch)
+  zsl_mixup_alpha: 0.2          # Mixup alpha (0 = disabled)
+  zsl_label_smoothing: 0.1      # Label smoothing for CrossEntropyLoss
 
 logging:
   use_tensorboard: true

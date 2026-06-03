@@ -87,7 +87,11 @@ def train_gan(
             with autocast("cuda", enabled=use_amp):
                 z = torch.randn(batch_size, nz, device=device)
                 fake_images = netG(z, labels, seen_embeddings)
-                g_loss_dict = loss_fn.generator_loss(netD, fake_images, labels, seen_embeddings)
+                g_loss_dict = loss_fn.generator_loss(
+                    netD, fake_images, labels, seen_embeddings,
+                    real_images=real_images,
+                    feature_matching_weight=cfg.get("feature_matching_weight", 0.0),
+                )
 
             scaler.scale(g_loss_dict["g_loss"]).backward()
             scaler.unscale_(optimizerG)

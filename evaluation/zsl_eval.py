@@ -20,24 +20,37 @@ zsl_augment = transforms.Compose(
 
 
 def _generate_synthetic_data(generator, num_samples, num_classes, semantic_embeddings, nz, batch_size, device):
-    """Pre-generate all synthetic images in batches (avoids 1-at-a-time GPU calls)."""
+    """Per-class balanced synthetic data generation — guarantees exactly samples_per_class per class."""
     generator.eval()
     all_images, all_labels = [], []
+    samples_per_class = num_samples // num_classes
 
     with torch.no_grad():
-        for i in tqdm(range(0, num_samples, batch_size), desc="Generating synthetic data"):
-            curr_bs = min(batch_size, num_samples - i)
-            z = torch.randn(curr_bs, nz, device=device)
-            labels = torch.randint(0, num_classes, (curr_bs,), device=device)
-            fake_imgs = generator(z, labels, semantic_embeddings)
-            # Generator outputs Tanh [-1,1]; keep as-is (matches real data Normalize(0.5,0.5))
-            all_images.append(fake_imgs.cpu())
-            all_labels.append(labels.cpu())
+        for cls in range(num_classes):
+            n_remaining = samples_per_class
+            while n_remaining > 0:
+                curr_bs = min(batch_size, n_remaining)
+                z = torch.randn(curr_bs, nz, device=device)
+                labels = torch.full((curr_bs,), cls, device=device, dtype=torch.long)
+                fake_imgs = generator(z, labels, semantic_embeddings)
+                all_images.append(fake_imgs.cpu())
+                all_labels.append(labels.cpu())
+                n_remaining -= curr_bs
 
     generator.train()
     images = torch.cat(all_images, dim=0)
     labels = torch.cat(all_labels, dim=0)
     return TensorDataset(images, labels)
+
+
+def _mixup_data(images, labels, alpha):
+    """Apply Mixup augmentation to a batch."""
+    if alpha <= 0:
+        return images, labels, labels, 1.0
+    lam = np.random.beta(alpha, alpha)
+    index = torch.randperm(images.size(0), device=images.device)
+    mixed_images = lam * images + (1 - lam) * images[index]
+    return mixed_images, labels, labels[index], lam
 
 
 def train_zsl_classifier(
@@ -56,36 +69,44 @@ def train_zsl_classifier(
     zsl_batch_size = config["evaluation"]["zsl_batch_size"]
     checkpoints_dir = config["paths"]["checkpoints_dir"]
 
-    print("\nGenerating synthetic training data...")
+    # ZSL training enhancements
+    regenerate_every = config["evaluation"].get("zsl_regenerate_every", 1)
+    mixup_alpha = config["evaluation"].get("zsl_mixup_alpha", 0.2)
+    label_smoothing = config["evaluation"].get("zsl_label_smoothing", 0.1)
+
     total_samples = samples_per_class * num_unseen
-    full_dataset = _generate_synthetic_data(
-        generator,
-        total_samples,
-        num_unseen,
-        unseen_semantic_embeddings,
-        nz,
-        batch_size=zsl_batch_size,
-        device=device,
-    )
-
-    train_size = int(0.8 * len(full_dataset))
-    val_size = len(full_dataset) - train_size
-    synth_train, synth_val = random_split(full_dataset, [train_size, val_size])
-
-    synth_train_loader = DataLoader(synth_train, batch_size=zsl_batch_size, shuffle=True)
-    synth_val_loader = DataLoader(synth_val, batch_size=100, shuffle=False)
+    train_size = int(0.8 * total_samples)
+    val_size = total_samples - train_size
 
     classifier = ZSLClassifier(num_unseen).to(device)
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
     optimizer = optim.AdamW(classifier.parameters(), lr=zsl_lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=3)
 
     best_val_acc = 0
     patience = 10
     epochs_without_improv = 0
+    synth_train_loader = None
+    synth_val_loader = None
 
-    print("\nTraining ZSL classifier...")
+    print("\nTraining ZSL classifier (per-epoch synthetic data regeneration)...")
     for epoch in range(zsl_epochs):
+        if epoch % regenerate_every == 0 or synth_train_loader is None:
+            print(f"  Regenerating synthetic data (epoch {epoch + 1})...")
+            full_dataset = _generate_synthetic_data(
+                generator,
+                total_samples,
+                num_unseen,
+                unseen_semantic_embeddings,
+                nz,
+                batch_size=zsl_batch_size,
+                device=device,
+            )
+            split_gen = torch.Generator().manual_seed(42)
+            synth_train, synth_val = random_split(full_dataset, [train_size, val_size], generator=split_gen)
+            synth_train_loader = DataLoader(synth_train, batch_size=zsl_batch_size, shuffle=True)
+            synth_val_loader = DataLoader(synth_val, batch_size=100, shuffle=False)
+
         classifier.train()
         train_loss = 0
         correct = 0
@@ -94,11 +115,18 @@ def train_zsl_classifier(
         pbar = tqdm(synth_train_loader, desc=f"ZSL Epoch {epoch + 1}/{zsl_epochs}")
         for images, labels in pbar:
             images, labels = images.to(device), labels.to(device)
-            # Data augmentation to reduce overfitting on synthetic data
             images = zsl_augment(images)
+
             optimizer.zero_grad(set_to_none=True)
-            outputs = classifier(images)
-            loss = criterion(outputs, labels)
+
+            if mixup_alpha > 0 and np.random.random() < 0.5:
+                mixed_images, labels_a, labels_b, lam = _mixup_data(images, labels, mixup_alpha)
+                outputs = classifier(mixed_images)
+                loss = lam * criterion(outputs, labels_a) + (1 - lam) * criterion(outputs, labels_b)
+            else:
+                outputs = classifier(images)
+                loss = criterion(outputs, labels)
+
             loss.backward()
             optimizer.step()
 
