@@ -1,6 +1,7 @@
 """
 Conditional Generator with Semantic Projection and Spectral Normalization.
-Includes SAGAN-style self-attention at 8x8 resolution.
+Includes SAGAN-style self-attention at configurable resolutions.
+Improvements: spectral norm on semantic projection, optional multi-scale attention.
 """
 
 import torch
@@ -34,14 +35,22 @@ class Generator(nn.Module):
     """
     Conditional Generator with Semantic Embeddings and Self-Attention.
 
-    Architecture:
-    - Noise (nz) + Semantic embedding (semantic_dim) -> Combined input
-    - Semantic projection network
-    - Main generation network (Conv layers with upsampling)
-    - Self-attention at 8x8 resolution
+    Improvements over baseline:
+    - Spectral normalization on semantic projection MLP (stabilizes conditioning)
+    - Configurable self-attention at multiple resolutions
     """
 
-    def __init__(self, nz: int = 128, ngf: int = 64, nc: int = 3, semantic_dim: int = 512, semantic_proj_dim: int = 256, dropout: float = 0.2):
+    def __init__(
+        self,
+        nz: int = 128,
+        ngf: int = 64,
+        nc: int = 3,
+        semantic_dim: int = 512,
+        semantic_proj_dim: int = 256,
+        dropout: float = 0.2,
+        use_spectral_norm_semantic: bool = True,
+        attention_resolutions: list = None,
+    ):
         super(Generator, self).__init__()
 
         self.nz = nz
@@ -50,15 +59,28 @@ class Generator(nn.Module):
         self.semantic_dim = semantic_dim
         self.semantic_proj_dim = semantic_proj_dim
 
-        # Semantic projection network
+        if attention_resolutions is None:
+            attention_resolutions = [8]
+
+        self.attention_resolutions = attention_resolutions
+
+        # Semantic projection network with optional spectral norm
+        sn = spectral_norm if use_spectral_norm_semantic else lambda x: x
         self.semantic_proj = nn.Sequential(
-            nn.Linear(semantic_dim, semantic_proj_dim), nn.LeakyReLU(0.2, inplace=True), nn.Dropout(dropout), nn.Linear(semantic_proj_dim, semantic_proj_dim), nn.LeakyReLU(0.2, inplace=True)
+            sn(nn.Linear(semantic_dim, semantic_proj_dim)),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Dropout(dropout),
+            sn(nn.Linear(semantic_proj_dim, semantic_proj_dim)),
+            nn.LeakyReLU(0.2, inplace=True),
         )
 
         combined_dim = nz + semantic_proj_dim
 
         # Initial projection from latent to feature map
-        self.project = nn.Sequential(spectral_norm(nn.Linear(combined_dim, ngf * 8 * 4 * 4)), nn.LeakyReLU(0.2, inplace=True))
+        self.project = nn.Sequential(
+            spectral_norm(nn.Linear(combined_dim, ngf * 8 * 4 * 4)),
+            nn.LeakyReLU(0.2, inplace=True),
+        )
 
         # 4x4 -> 8x8
         self.up1 = nn.Sequential(
@@ -68,7 +90,7 @@ class Generator(nn.Module):
             nn.BatchNorm2d(ngf * 4),
             nn.LeakyReLU(0.2, inplace=True),
         )
-        self.attn = SelfAttention(ngf * 4)
+        self.attn8 = SelfAttention(ngf * 4) if 8 in attention_resolutions else nn.Identity()
 
         # 8x8 -> 16x16
         self.up2 = nn.Sequential(
@@ -77,9 +99,14 @@ class Generator(nn.Module):
             nn.BatchNorm2d(ngf * 2),
             nn.LeakyReLU(0.2, inplace=True),
         )
+        self.attn16 = SelfAttention(ngf * 2) if 16 in attention_resolutions else nn.Identity()
 
         # 16x16 -> 32x32
-        self.up3 = nn.Sequential(nn.Upsample(scale_factor=2, mode="nearest"), spectral_norm(nn.Conv2d(ngf * 2, nc, 3, 1, 1)), nn.Tanh())
+        self.up3 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="nearest"),
+            spectral_norm(nn.Conv2d(ngf * 2, nc, 3, 1, 1)),
+            nn.Tanh(),
+        )
 
         self.apply(self._init_weights)
 
@@ -95,48 +122,8 @@ class Generator(nn.Module):
         x = self.project(x)
         x = x.view(-1, self.ngf * 8, 4, 4)
         x = self.up1(x)
-        x = self.attn(x)
+        x = self.attn8(x)
         x = self.up2(x)
+        x = self.attn16(x)
         x = self.up3(x)
         return x
-
-
-def test_generator():
-    """Test generator with CLIP embeddings"""
-    print("Testing Generator with CLIP embeddings...")
-
-    # Configuration
-    batch_size = 8
-    nz = 128
-    num_classes = 100
-    semantic_dim = 512  # CLIP dimension
-
-    # Create generator
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    generator = Generator(nz=nz, ngf=64, nc=3, semantic_dim=semantic_dim, semantic_proj_dim=256).to(device)
-
-    # Create dummy inputs
-    z = torch.randn(batch_size, nz, device=device)
-    labels = torch.randint(0, num_classes, (batch_size,), device=device)
-    semantic_embeddings = torch.randn(num_classes, semantic_dim, device=device)
-
-    # Forward pass
-    fake_images = generator(z, labels, semantic_embeddings)
-
-    print(f"✓ Input noise shape: {z.shape}")
-    print(f"✓ Input labels shape: {labels.shape}")
-    print(f"✓ Semantic embeddings shape: {semantic_embeddings.shape}")
-    print(f"✓ Output images shape: {fake_images.shape}")
-    print(f"✓ Output range: [{fake_images.min().item():.2f}, {fake_images.max().item():.2f}]")
-    print(f"✓ Generator parameters: {sum(p.numel() for p in generator.parameters()):,}")
-
-    # Check output is valid
-    assert fake_images.shape == (batch_size, 3, 32, 32), "Wrong output shape!"
-    assert fake_images.min() >= -1 and fake_images.max() <= 1, "Output not in [-1, 1]!"
-
-    print("\n✓ Generator test passed!")
-    return generator
-
-
-if __name__ == "__main__":
-    test_generator()

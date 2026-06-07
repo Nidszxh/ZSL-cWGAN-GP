@@ -1,3 +1,9 @@
+"""
+ZSL Classifier Training and Evaluation.
+
+Uses a pretrained-backbone classifier trained on synthetic unseen-class images.
+"""
+
 from pathlib import Path
 
 import numpy as np
@@ -8,9 +14,8 @@ from torch.utils.data import DataLoader, TensorDataset, random_split
 from torchvision import transforms
 from tqdm import tqdm
 
-from models.zsl_classifier import ZSLClassifier
+from models.zsl_classifier import ZSLClassifier, build_classifier_from_config
 
-# Data augmentation for ZSL classifier training — reduces overfitting on synthetic data
 zsl_augment = transforms.Compose(
     [
         transforms.RandomCrop(32, padding=4),
@@ -20,7 +25,7 @@ zsl_augment = transforms.Compose(
 
 
 def _generate_synthetic_data(generator, num_samples, num_classes, semantic_embeddings, nz, batch_size, device):
-    """Per-class balanced synthetic data generation — guarantees exactly samples_per_class per class."""
+    """Per-class balanced synthetic data generation."""
     generator.eval()
     all_images, all_labels = [], []
     samples_per_class = num_samples // num_classes
@@ -44,7 +49,6 @@ def _generate_synthetic_data(generator, num_samples, num_classes, semantic_embed
 
 
 def _mixup_data(images, labels, alpha):
-    """Apply Mixup augmentation to a batch."""
     if alpha <= 0:
         return images, labels, labels, 1.0
     lam = np.random.beta(alpha, alpha)
@@ -59,7 +63,7 @@ def train_zsl_classifier(
     unseen_classes,
     test_loader,
     device,
-    config: dict,
+    config,
 ):
     num_unseen = len(unseen_classes)
     nz = config["model"]["generator"]["nz"]
@@ -69,7 +73,6 @@ def train_zsl_classifier(
     zsl_batch_size = config["evaluation"]["zsl_batch_size"]
     checkpoints_dir = config["paths"]["checkpoints_dir"]
 
-    # ZSL training enhancements
     regenerate_every = config["evaluation"].get("zsl_regenerate_every", 1)
     mixup_alpha = config["evaluation"].get("zsl_mixup_alpha", 0.2)
     label_smoothing = config["evaluation"].get("zsl_label_smoothing", 0.1)
@@ -78,7 +81,7 @@ def train_zsl_classifier(
     train_size = int(0.8 * total_samples)
     val_size = total_samples - train_size
 
-    classifier = ZSLClassifier(num_unseen).to(device)
+    classifier = build_classifier_from_config(num_unseen, config).to(device)
     criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
     optimizer = optim.AdamW(classifier.parameters(), lr=zsl_lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=3)
@@ -134,7 +137,12 @@ def train_zsl_classifier(
             _, predicted = outputs.max(1)
             total += labels.size(0)
             correct += predicted.eq(labels).sum().item()
-            pbar.set_postfix({"Loss": f"{train_loss / max(1, pbar.n + 1):.4f}", "Acc": f"{100.0 * correct / total:.2f}%"})
+            pbar.set_postfix(
+                {
+                    "Loss": f"{train_loss / max(1, pbar.n + 1):.4f}",
+                    "Acc": f"{100.0 * correct / total:.2f}%",
+                }
+            )
 
         classifier.eval()
         val_correct = 0
@@ -162,18 +170,13 @@ def train_zsl_classifier(
                 print(f"Early stopping after {epoch + 1} epochs")
                 break
 
-    classifier.load_state_dict(torch.load(Path(checkpoints_dir) / "best_zsl_classifier.pth"))
+    classifier.load_state_dict(
+        torch.load(Path(checkpoints_dir) / "best_zsl_classifier.pth", weights_only=True)
+    )
     return classifier
 
 
-def evaluate_zsl(
-    classifier,
-    test_loader,
-    unseen_classes,
-    class_names,
-    device,
-    results_dir: str = "results",
-):
+def evaluate_zsl(classifier, test_loader, unseen_classes, class_names, device, results_dir="results"):
     num_unseen = len(unseen_classes)
     classifier.eval()
 
@@ -205,7 +208,10 @@ def evaluate_zsl(
 
     top1_accuracy = 100.0 * correct / total
     top5_accuracy = 100.0 * top5_correct / total
-    per_class_acc = [100.0 * class_correct[i] / class_total[i] if class_total[i] > 0 else 0 for i in range(num_unseen)]
+    per_class_acc = [
+        100.0 * class_correct[i] / class_total[i] if class_total[i] > 0 else 0
+        for i in range(num_unseen)
+    ]
     mean_class_acc = float(np.mean(per_class_acc))
 
     for i in range(num_unseen):

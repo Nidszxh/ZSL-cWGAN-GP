@@ -127,7 +127,7 @@ def plot_zsl_class_accuracy(zsl_metrics, save_dir: str = "results"):
     plt.close()
 
 
-def create_experiment_summary(tracker, zsl_metrics, final_fid, config, save_dir: str = "results"):
+def create_experiment_summary(tracker, zsl_metrics, final_fid, config, save_dir: str = "results", gzsl_metrics=None):
     fig = plt.figure(figsize=(18, 12))
     gs = fig.add_gridspec(3, 3, hspace=0.3, wspace=0.3)
 
@@ -182,17 +182,41 @@ def create_experiment_summary(tracker, zsl_metrics, final_fid, config, save_dir:
         ax5.grid(True, alpha=0.3)
 
     ax6 = fig.add_subplot(gs[2, :2])
-    zsl_acc_path = Path(save_dir) / "zsl_class_accuracy.png"
-    if zsl_acc_path.exists():
-        img = plt.imread(zsl_acc_path)
-        ax6.imshow(img)
-        ax6.set_title("Zero-Shot Learning Per-Class Accuracy", fontsize=14, fontweight="bold")
-    ax6.axis("off")
+    if gzsl_metrics is not None:
+        gzsl_path = Path(save_dir) / "gzsl_results.png"
+        if gzsl_path.exists():
+            img = plt.imread(gzsl_path)
+            ax6.imshow(img)
+            ax6.set_title("GZSL Results (Seen + Unseen)", fontsize=14, fontweight="bold")
+        else:
+            zsl_acc_path = Path(save_dir) / "zsl_class_accuracy.png"
+            if zsl_acc_path.exists():
+                img = plt.imread(zsl_acc_path)
+                ax6.imshow(img)
+                ax6.set_title("Zero-Shot Learning Per-Class Accuracy", fontsize=14, fontweight="bold")
+        ax6.axis("off")
+    else:
+        zsl_acc_path = Path(save_dir) / "zsl_class_accuracy.png"
+        if zsl_acc_path.exists():
+            img = plt.imread(zsl_acc_path)
+            ax6.imshow(img)
+            ax6.set_title("Zero-Shot Learning Per-Class Accuracy", fontsize=14, fontweight="bold")
+        ax6.axis("off")
 
     ax7 = fig.add_subplot(gs[2, 2])
     ax7.axis("off")
 
     num_epochs = tracker.metrics_history[-1][0] if tracker.metrics_history else "?"
+
+    gzsl_section = ""
+    if gzsl_metrics is not None:
+        gzsl_section = f"""
+GZSL:
+  Seen Acc: {gzsl_metrics['seen_accuracy']:.2f}%
+  Unseen Acc: {gzsl_metrics['unseen_accuracy']:.2f}%
+  Harmonic Mean: {gzsl_metrics['harmonic_mean']:.2f}%
+"""
+
     summary_text = f"""
 EXPERIMENT SUMMARY
 {'=' * 30}
@@ -205,12 +229,14 @@ Zero-Shot Learning:
   Top-1 Acc: {zsl_metrics['top1_accuracy']:.2f}%
   Top-5 Acc: {zsl_metrics['top5_accuracy']:.2f}%
   Mean Class: {zsl_metrics['mean_class_accuracy']:.2f}%
-
+{gzsl_section}
 Training:
   Epochs: {num_epochs}
   Batch Size: {config['training']['batch_size']}
   LR G: {config['training']['lr_g']}
   LR D: {config['training']['lr_d']}
+  Classifier: {config.get('model', {}).get('classifier', {}).get('backbone', 'resnet18')}
+  Embeddings: {config['embeddings']['type']}
 """
     ax7.text(
         0.1,

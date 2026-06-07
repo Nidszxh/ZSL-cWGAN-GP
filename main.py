@@ -2,7 +2,6 @@ import sys
 import warnings
 from pathlib import Path
 
-# Suppress NumPy 2.4+ deprecation warning from torchvision's CIFAR-100 loader
 warnings.filterwarnings("ignore", message=".*align should be passed as Python or NumPy boolean.*")
 
 import numpy as np
@@ -12,6 +11,7 @@ import yaml
 from torchvision import datasets
 
 from evaluation.gan_eval import compute_fid, save_fake_images, save_real_images
+from evaluation.gzsl_eval import evaluate_gzsl, plot_gzsl_results, train_gzsl_classifier
 from evaluation.zsl_eval import evaluate_zsl, train_zsl_classifier
 from models.discriminator import Discriminator
 from models.generator import Generator
@@ -97,6 +97,8 @@ def main():
         semantic_dim=embedding_dim,
         semantic_proj_dim=gen_cfg["semantic_proj_dim"],
         dropout=gen_cfg["dropout"],
+        use_spectral_norm_semantic=gen_cfg.get("use_spectral_norm_semantic", True),
+        attention_resolutions=gen_cfg.get("attention_resolutions", [8]),
     ).to(device)
 
     netD = Discriminator(
@@ -124,7 +126,9 @@ def main():
 
     # Load best model
     print(f"\nLoading best model with FID: {tracker.best_fid:.2f}")
-    checkpoint = torch.load(Path(config["paths"]["checkpoints_dir"]) / "best_model.pth")
+    checkpoint = torch.load(
+        Path(config["paths"]["checkpoints_dir"]) / "best_model.pth", weights_only=False
+    )
     netG.load_state_dict(checkpoint["generator"])
     netD.load_state_dict(checkpoint["discriminator"])
 
@@ -142,7 +146,9 @@ def main():
         save_dir=f"{config['paths']['results_dir']}/fake_final",
     )
     final_metrics = compute_fid(real_images_dir, final_fake_dir)
-    print(f"Final FID: {final_metrics['fid']:.2f} | IS: {final_metrics['is_mean']:.2f} +- {final_metrics['is_std']:.2f}")
+    print(
+        f"Final FID: {final_metrics['fid']:.2f} | IS: {final_metrics['is_mean']:.2f} +- {final_metrics['is_std']:.2f}"
+    )
 
     # Sample grid
     generate_final_sample_grid(
@@ -179,13 +185,17 @@ def main():
                 grid = vutils.make_grid(fake_imgs[:16], nrow=4, padding=2, normalize=False)
                 vutils.save_image(grid, class_dir / "samples_grid.png")
 
-    # ZSL evaluation
+    # =====================================================
+    # ZSL Evaluation (unseen classes only)
+    # =====================================================
     print("\n" + "=" * 70)
     print("ZERO-SHOT LEARNING EVALUATION")
     print("=" * 70)
 
     test_loader, test_class_info = get_test_loader(config, unseen_classes)
-    classifier = train_zsl_classifier(netG, unseen_embeddings, unseen_classes, test_loader, device, config)
+    classifier = train_zsl_classifier(
+        netG, unseen_embeddings, unseen_classes, test_loader, device, config
+    )
     zsl_metrics = evaluate_zsl(
         classifier,
         test_loader,
@@ -195,11 +205,46 @@ def main():
         results_dir=config["paths"]["results_dir"],
     )
 
-    # ZSL plots
     plot_zsl_confusion_matrix(zsl_metrics, save_dir=config["paths"]["results_dir"])
     plot_zsl_class_accuracy(zsl_metrics, save_dir=config["paths"]["results_dir"])
 
+    # =====================================================
+    # GZSL Evaluation (seen + unseen classes)
+    # =====================================================
+    gzsl_cfg = config["evaluation"].get("gzsl", {})
+    if gzsl_cfg.get("enabled", False):
+        print("\n" + "=" * 70)
+        print("GENERALIZED ZERO-SHOT LEARNING (GZSL) EVALUATION")
+        print("=" * 70)
+
+        gzsl_classifier = train_gzsl_classifier(
+            generator=netG,
+            seen_semantic_embeddings=seen_embeddings,
+            unseen_semantic_embeddings=unseen_embeddings,
+            seen_classes=seen_classes,
+            unseen_classes=unseen_classes,
+            train_loader=train_loader,
+            test_loader=test_loader,
+            device=device,
+            config=config,
+        )
+
+        if gzsl_classifier is not None:
+            gzsl_metrics = evaluate_gzsl(
+                classifier=gzsl_classifier,
+                seen_classes=seen_classes,
+                unseen_classes=unseen_classes,
+                test_loader=test_loader,
+                seen_train_loader=train_loader,
+                class_names=class_names,
+                device=device,
+                results_dir=config["paths"]["results_dir"],
+            )
+            plot_gzsl_results(gzsl_metrics, save_dir=config["paths"]["results_dir"])
+
+    # =====================================================
     # Summary
+    # =====================================================
     create_experiment_summary(
         tracker,
         zsl_metrics,
@@ -214,10 +259,17 @@ def main():
     print("\nGAN Metrics:")
     print(f"  Best FID: {tracker.best_fid:.2f}")
     print(f"  Final FID: {final_metrics['fid']:.2f}")
-    print("\nZero-Shot Learning:")
+    print("\nZero-Shot Learning (unseen only):")
     print(f"  Top-1 Accuracy: {zsl_metrics['top1_accuracy']:.2f}%")
     print(f"  Top-5 Accuracy: {zsl_metrics['top5_accuracy']:.2f}%")
     print(f"  Mean Class Accuracy: {zsl_metrics['mean_class_accuracy']:.2f}%")
+
+    if gzsl_cfg.get("enabled", False) and gzsl_classifier is not None:
+        print("\nGeneralized Zero-Shot Learning (seen + unseen):")
+        print(f"  Seen Accuracy: {gzsl_metrics['seen_accuracy']:.2f}%")
+        print(f"  Unseen Accuracy: {gzsl_metrics['unseen_accuracy']:.2f}%")
+        print(f"  Harmonic Mean (H): {gzsl_metrics['harmonic_mean']:.2f}%")
+
     print(f"\nResults: {config['paths']['results_dir']}/")
     print(f"Checkpoints: {config['paths']['checkpoints_dir']}/")
     print(f"TensorBoard: {config['paths']['tensorboard_dir']}/")
