@@ -18,40 +18,41 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from evaluation.gan_eval import compute_fid, save_fake_images
-from training.losses import WGANGPLoss
-from utils.metrics import MetricsTracker
-from utils.visualization import save_sample_grid
+from src.evaluation.gan_eval import compute_fid, save_fake_images
+from src.training.losses import WGANGPLoss
+from src.utils.metrics import MetricsTracker
+from src.utils.visualization import save_sample_grid
 
 
 class EMAModel:
     """Exponential Moving Average of model parameters (state-dict based, no deepcopy)."""
 
-    def __init__(self, model, decay=0.999):
+    def __init__(self, model: nn.Module, decay: float = 0.999):
         self.model = model
         self.decay = decay
         self.shadow = {k: v.clone().detach() for k, v in model.state_dict().items()}
 
     @torch.no_grad()
-    def update(self):
+    def update(self) -> None:
         model_dict = self.model.state_dict()
         for k in self.shadow:
             self.shadow[k] = self.decay * self.shadow[k] + (1 - self.decay) * model_dict[k]
 
-    def apply_shadow(self):
+    def apply_shadow(self) -> None:
         self.backup = {k: v.clone().detach() for k, v in self.model.state_dict().items()}
         self.model.load_state_dict(
             {k: v.to(self.model.parameters().__next__().device) for k, v in self.shadow.items()}
         )
 
-    def restore(self):
+    def restore(self) -> None:
         self.model.load_state_dict(self.backup)
         del self.backup
 
-    def state_dict(self):
+    def state_dict(self) -> dict:
         return self.shadow
 
 
@@ -71,12 +72,13 @@ def _get_scheduler(optimizer, cfg, num_epochs, warmup_epochs):
 def train_gan(
     netG: nn.Module,
     netD: nn.Module,
-    train_loader,
+    train_loader: DataLoader,
     seen_embeddings: torch.Tensor,
     device: torch.device,
     config: dict,
     real_images_dir: str,
-):
+    resume_path: str = None,
+) -> MetricsTracker:
     cfg = config["training"]
     paths = config["paths"]
     eval_cfg = config["evaluation"]
@@ -112,6 +114,29 @@ def train_gan(
     fixed_noise = torch.randn(16, nz, device=device)
     fixed_labels = torch.randint(0, num_seen_classes, (16,), device=device)
     global_step = 0
+    start_epoch = 0
+
+    # Resume from checkpoint if specified
+    if resume_path is not None:
+        resume_path = Path(resume_path)
+        if not resume_path.exists():
+            print(f"Warning: resume path {resume_path} not found, starting from scratch")
+        else:
+            print(f"\nResuming from checkpoint: {resume_path}")
+            ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+            netG.load_state_dict(ckpt["generator"])
+            netD.load_state_dict(ckpt["discriminator"])
+            optimizerG.load_state_dict(ckpt["optimizerG"])
+            optimizerD.load_state_dict(ckpt["optimizerD"])
+            schedulerG.load_state_dict(ckpt["schedulerG"])
+            schedulerD.load_state_dict(ckpt["schedulerD"])
+            start_epoch = ckpt["epoch"]
+            global_step = ckpt.get("global_step", 0)
+            tracker.epochs_without_improv = ckpt.get("epochs_without_improv", 0)
+
+            if use_ema and "ema_shadow" in ckpt and start_epoch >= ema_start_epoch:
+                ema.shadow = {k: v.to(device) if torch.is_tensor(v) else v for k, v in ckpt["ema_shadow"].items()}
+            print(f"Resumed at epoch {start_epoch}, global_step {global_step}")
 
     if use_amp:
         print("Mixed precision training enabled (FP16)")
@@ -119,10 +144,13 @@ def train_gan(
         print(f"EMA enabled (decay={ema_decay}, starts at epoch {ema_start_epoch})")
 
     print("\n" + "=" * 70)
-    print("STARTING TRAINING")
+    if start_epoch > 0:
+        print(f"RESUMING TRAINING FROM EPOCH {start_epoch}")
+    else:
+        print("STARTING TRAINING")
     print("=" * 70)
 
-    for epoch in range(cfg["num_epochs"]):
+    for epoch in range(start_epoch, cfg["num_epochs"]):
         netG.train()
         netD.train()
 
@@ -215,8 +243,10 @@ def train_gan(
         schedulerD.step()
         schedulerG.step()
 
-        eval_model = ema.shadow if (use_ema and epoch >= ema_start_epoch) else netG
-        grid = save_sample_grid(eval_model, fixed_noise, fixed_labels, seen_embeddings, epoch + 1, device, save_dir=paths["results_dir"])
+        if use_ema and epoch >= ema_start_epoch:
+            ema.apply_shadow()
+
+        grid = save_sample_grid(netG, fixed_noise, fixed_labels, seen_embeddings, epoch + 1, device, save_dir=paths["results_dir"])
         writer.add_image("Generated_Samples", grid, epoch + 1)
 
         if (epoch + 1) % cfg["eval_interval"] == 0 or epoch == cfg["num_epochs"] - 1:
@@ -225,7 +255,7 @@ def train_gan(
             print(f"{'=' * 70}")
 
             fake_dir = save_fake_images(
-                eval_model,
+                netG,
                 epoch + 1,
                 device,
                 num_samples=eval_cfg["fid_samples"],
@@ -242,7 +272,7 @@ def train_gan(
             improved = tracker.update_metrics(
                 metrics,
                 epoch + 1,
-                eval_model if use_ema else netG,
+                netG,
                 netD,
                 checkpoints_dir=paths["checkpoints_dir"],
             )
@@ -251,9 +281,15 @@ def train_gan(
             else:
                 print(f"FID: {metrics['fid']:.2f} vs best {tracker.best_fid:.2f}")
 
+            if use_ema and epoch >= ema_start_epoch:
+                ema.restore()
+
             if tracker.should_stop_early(cfg["early_stopping_patience"]):
                 print(f"\nEarly stopping after {epoch + 1} epochs without improvement\n")
                 break
+        else:
+            if use_ema and epoch >= ema_start_epoch:
+                ema.restore()
 
         if (epoch + 1) % cfg["save_interval"] == 0:
             ckpt_dir = Path(paths["checkpoints_dir"])
@@ -266,6 +302,8 @@ def train_gan(
                 "optimizerD": optimizerD.state_dict(),
                 "schedulerG": schedulerG.state_dict(),
                 "schedulerD": schedulerD.state_dict(),
+                "global_step": global_step,
+                "epochs_without_improv": tracker.epochs_without_improv,
                 "config": config,
             }
             if use_ema and epoch >= ema_start_epoch:

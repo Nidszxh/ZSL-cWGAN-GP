@@ -20,13 +20,20 @@ class MetricsTracker:
         self.epochs_without_improv = 0
         self.writer = writer
 
-    def update(self, g_loss: float, d_loss: float, w_dist: float, gp: float):
+    def update(self, g_loss: float, d_loss: float, w_dist: float, gp: float) -> None:
         self.g_losses.append(g_loss)
         self.d_losses.append(d_loss)
         self.w_distances.append(w_dist)
         self.gp_values.append(gp)
 
-    def update_metrics(self, metrics: dict, epoch: int, netG: torch.nn.Module, netD: torch.nn.Module, checkpoints_dir: str = "checkpoints") -> bool:
+    def update_metrics(
+        self,
+        metrics: dict,
+        epoch: int,
+        netG: torch.nn.Module,
+        netD: torch.nn.Module,
+        checkpoints_dir: str = "checkpoints",
+    ) -> bool:
         fid_score = metrics["fid"]
         self.metrics_history.append((epoch, metrics))
 

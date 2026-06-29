@@ -1,7 +1,4 @@
-"""
-Test script for CLIP embeddings
-Day 1: Verify CLIP integration works
-"""
+"""Test script for CLIP embeddings."""
 
 import torch
 import yaml
@@ -10,9 +7,9 @@ from pathlib import Path
 import sys
 
 # Add project root to path
-sys.path.append(str(Path(__file__).parent))
+sys.path.append(str(Path(__file__).parent.parent))
 
-from utils.embeddings import CLIPTextEmbedder, GloVeEmbedder, EmbeddingManager, compare_embeddings
+from src.utils.embeddings import CLIPTextEmbedder, GloVeEmbedder, EmbeddingManager
 
 
 def test_clip_basic():
@@ -90,9 +87,7 @@ def test_glove_comparison():
         glove_emb = glove_embedder.get_class_embeddings(test_classes)
         print(f"✓ GloVe embeddings: {len(glove_emb)} classes, dim={glove_emb[0].shape[0]}")
 
-        # Visualize comparison
-        print("\nGenerating comparison visualization...")
-        compare_embeddings(class_names, sample_classes=list(range(20)))
+        print(f"  CLIP/{len(clip_emb)} vs GloVe/{len(glove_emb)} classes available for comparison")
 
     except Exception as e:
         print(f"⚠ GloVe not available (this is OK): {e}")
@@ -107,7 +102,7 @@ def test_embedding_manager():
     print("=" * 70)
 
     # Load config
-    config_path = Path("configs/config.yaml")
+    config_path = Path("src/configs/config.yaml")
     if not config_path.exists():
         print("⚠ Config file not found, using defaults")
         config = {
@@ -201,7 +196,7 @@ def test_embedding_quality():
 def run_all_tests():
     """Run all tests"""
     print("\n" + "=" * 70)
-    print("CLIP EMBEDDINGS TEST SUITE - DAY 1")
+    print("CLIP EMBEDDINGS TEST SUITE")
     print("=" * 70 + "\n")
 
     results = {}

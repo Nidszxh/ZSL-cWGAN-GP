@@ -1,7 +1,4 @@
-"""
-Data Loader Module
-Day 2: CIFAR-100 with seen/unseen split
-"""
+"""Data Loader Module: CIFAR-100 with seen/unseen split."""
 
 import torch
 import numpy as np
@@ -30,7 +27,12 @@ class FilteredCIFAR100(datasets.CIFAR100):
             self.targets = [self.org_to_new[target] for target in self.targets]
 
 
-def get_class_split(num_classes: int = 100, seen_count: int = 80, cache_dir: str = "./cache", seed: int = 42) -> Tuple[np.ndarray, np.ndarray]:
+def get_class_split(
+    num_classes: int = 100,
+    seen_count: int = 80,
+    cache_dir: str = "./cache",
+    seed: int = 42,
+) -> Tuple[np.ndarray, np.ndarray]:
     """
     Get or create seen/unseen class split
 
@@ -68,7 +70,10 @@ def get_class_split(num_classes: int = 100, seen_count: int = 80, cache_dir: str
     return seen_classes, unseen_classes
 
 
-def get_data_loaders(config: dict, seen_classes: np.ndarray) -> Tuple[DataLoader, DataLoader, dict]:
+def get_data_loaders(
+    config: dict,
+    seen_classes: np.ndarray,
+) -> Tuple[DataLoader, DataLoader, dict]:
     """
     Create train and validation data loaders
 
@@ -90,17 +95,16 @@ def get_data_loaders(config: dict, seen_classes: np.ndarray) -> Tuple[DataLoader
 
     transform_val = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
 
-    # Create dataset
+    # Create separate datasets with different transforms
     train_dataset = FilteredCIFAR100(root=config["paths"]["data_root"], train=True, download=True, transform=transform_train, allowed_classes=seen_classes)
+    val_dataset = FilteredCIFAR100(root=config["paths"]["data_root"], train=True, download=True, transform=transform_val, allowed_classes=seen_classes)
 
-    # Split into train/val
+    # Aligned split using same generator seed — yields matching indices
+    split_gen = torch.Generator().manual_seed(config["experiment"]["seed"])
     train_size = int(0.9 * len(train_dataset))
     val_size = len(train_dataset) - train_size
-    train_subset, val_subset = random_split(train_dataset, [train_size, val_size], generator=torch.Generator().manual_seed(config["experiment"]["seed"]))
-
-    # Update val subset transform
-    val_dataset = FilteredCIFAR100(root=config["paths"]["data_root"], train=True, download=True, transform=transform_val, allowed_classes=seen_classes)
-    val_subset.dataset = val_dataset
+    train_subset, _ = random_split(train_dataset, [train_size, val_size], generator=split_gen)
+    _, val_subset = random_split(val_dataset, [train_size, val_size], generator=split_gen)
 
     # Create loaders
     num_workers = min(config["dataset"]["num_workers"], 4)
@@ -119,7 +123,10 @@ def get_data_loaders(config: dict, seen_classes: np.ndarray) -> Tuple[DataLoader
     return train_loader, val_loader, class_info
 
 
-def get_test_loader(config: dict, unseen_classes: np.ndarray) -> Tuple[DataLoader, dict]:
+def get_test_loader(
+    config: dict,
+    unseen_classes: np.ndarray,
+) -> Tuple[DataLoader, dict]:
     """
     Create test data loader for unseen classes
 

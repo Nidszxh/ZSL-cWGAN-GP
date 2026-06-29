@@ -19,12 +19,12 @@ import yaml
 from PIL import Image
 from torchvision import datasets
 
-from models.zsl_classifier import ZSLClassifier
+from src.models.zsl_classifier import build_classifier_from_config
 
 warnings.filterwarnings("ignore", message=".*align should be passed as Python or NumPy boolean.*")
 
 
-def load_model(config_path: str = "configs/config.yaml"):
+def load_model(config_path: str = "src/configs/config.yaml"):
     with open(config_path) as f:
         config = yaml.safe_load(f)
 
@@ -43,7 +43,7 @@ def load_model(config_path: str = "configs/config.yaml"):
         return None, None, device, config
 
     num_unseen = len(unseen_indices)
-    classifier = ZSLClassifier(num_unseen).to(device)
+    classifier = build_classifier_from_config(num_unseen, config).to(device)
     classifier.load_state_dict(torch.load(ckpt_path, map_location=device, weights_only=True))
     classifier.eval()
 
@@ -62,11 +62,14 @@ def initialize():
     return CLASSIFIER is not None
 
 
-initialize()
+try:
+    initialize()
+except Exception as e:
+    print(f"Warning: Could not load model: {e}")
 
 transform = transforms.Compose(
     [
-        transforms.Resize(32),
+        transforms.Resize((32, 32)),
         transforms.ToTensor(),
         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
     ]

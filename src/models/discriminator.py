@@ -75,13 +75,13 @@ class Discriminator(nn.Module):
         h = self.features(x)  # [B, ndf*8, 4, 4]
 
         # Unconditional output
-        output = self.output(h).squeeze()
+        output = self.output(h).view(-1)
 
         # Conditional output (projection)
         sem_features = self.semantic_proj(semantic_embeddings[labels])
         projection = self.embed_output(sem_features).view(-1, self.ndf * 8, 1, 1)
         h_pooled = F.adaptive_avg_pool2d(h, 1).view(-1, self.ndf * 8)
-        cond_output = torch.sum(projection.squeeze() * h_pooled, dim=1)
+        cond_output = torch.sum(projection.view(-1, self.ndf * 8) * h_pooled, dim=1)
 
         if return_features:
             return output + cond_output, h

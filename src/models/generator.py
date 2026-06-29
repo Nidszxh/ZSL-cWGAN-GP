@@ -4,6 +4,8 @@ Includes SAGAN-style self-attention at configurable resolutions.
 Improvements: spectral norm on semantic projection, optional multi-scale attention.
 """
 
+from typing import Optional
+
 import torch
 import torch.nn as nn
 from torch.nn.utils import spectral_norm
@@ -49,7 +51,7 @@ class Generator(nn.Module):
         semantic_proj_dim: int = 256,
         dropout: float = 0.2,
         use_spectral_norm_semantic: bool = True,
-        attention_resolutions: list = None,
+        attention_resolutions: Optional[list] = None,
     ):
         super(Generator, self).__init__()
 

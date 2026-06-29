@@ -106,6 +106,9 @@ class CLIPEnsembleEmbedder:
         self.device = device
         self.normalize = normalize
 
+        if not model_names:
+            raise ValueError("model_names must be non-empty for CLIPEnsembleEmbedder")
+
         for name in model_names:
             embedder = CLIPTextEmbedder(
                 model_name=name,
@@ -239,7 +242,7 @@ class EmbeddingManager:
         self.clip_embedder = None
         self.glove_embedder = None
 
-        if self.embedding_type == "clip":
+        if self.embedding_type in ("clip", "both"):
             self.clip_embedder = CLIPTextEmbedder(
                 model_name=config["embeddings"]["clip_model"],
                 device=self.device,
@@ -257,7 +260,8 @@ class EmbeddingManager:
                 cache_dir=config["embeddings"]["clip_cache_dir"],
                 normalize=config["embeddings"]["normalize"],
             )
-        elif self.embedding_type in ["glove", "both"]:
+
+        if self.embedding_type in ("glove", "both"):
             self.glove_embedder = GloVeEmbedder(
                 glove_file=config["embeddings"]["glove_path"],
                 cache_dir=config["paths"]["cache_dir"],
@@ -265,7 +269,9 @@ class EmbeddingManager:
             )
 
     def get_embeddings(
-        self, class_names: List[str], class_indices: Optional[np.ndarray] = None
+        self,
+        class_names: List[str],
+        class_indices: Optional[np.ndarray] = None,
     ) -> Tuple[torch.Tensor, int]:
         cache_file = Path(self.config["paths"]["cache_dir"]) / f"embeddings_{self.embedding_type}.pkl"
 

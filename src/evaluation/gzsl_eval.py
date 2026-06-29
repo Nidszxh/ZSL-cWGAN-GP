@@ -7,15 +7,33 @@ Evaluates on BOTH seen + unseen classes simultaneously, reporting:
 """
 
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset, TensorDataset, random_split
+from torch.utils.data import ConcatDataset, DataLoader, Dataset, TensorDataset, random_split
 from torchvision import transforms
 from tqdm import tqdm
+
+from src.utils.data_loader import FilteredCIFAR100
+
+
+class _LabelShiftedDataset(Dataset):
+    """Shifts labels by a fixed offset for ConcatDataset compatibility."""
+
+    def __init__(self, dataset, offset):
+        self.dataset = dataset
+        self.offset = offset
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        img, label = self.dataset[idx]
+        return img, label + self.offset
 
 
 zsl_augment = transforms.Compose(
@@ -56,16 +74,26 @@ class CalibratedClassifier(nn.Module):
         return torch.cat([seen_logits, unseen_logits], dim=1)
 
 
-def _mixup_data(images, labels, alpha):
-    if alpha <= 0:
-        return images, labels, labels, 1.0
+def _mixup_data(
+    images: torch.Tensor,
+    labels: torch.Tensor,
+    alpha: float,
+) -> tuple:
     lam = np.random.beta(alpha, alpha)
     index = torch.randperm(images.size(0), device=images.device)
     mixed_images = lam * images + (1 - lam) * images[index]
     return mixed_images, labels, labels[index], lam
 
 
-def _generate_synthetic_data(generator, num_samples, num_classes, semantic_embeddings, nz, batch_size, device):
+def _generate_synthetic_data(
+    generator: torch.nn.Module,
+    num_samples: int,
+    num_classes: int,
+    semantic_embeddings: torch.Tensor,
+    nz: int,
+    batch_size: int,
+    device: torch.device,
+) -> TensorDataset:
     generator.eval()
     all_images, all_labels = [], []
     samples_per_class = num_samples // num_classes
@@ -89,16 +117,15 @@ def _generate_synthetic_data(generator, num_samples, num_classes, semantic_embed
 
 
 def train_gzsl_classifier(
-    generator,
-    seen_semantic_embeddings,
-    unseen_semantic_embeddings,
-    seen_classes,
-    unseen_classes,
-    train_loader,
-    test_loader,
-    device,
-    config,
-):
+    generator: torch.nn.Module,
+    seen_semantic_embeddings: torch.Tensor,
+    unseen_semantic_embeddings: torch.Tensor,
+    seen_classes: np.ndarray,
+    unseen_classes: np.ndarray,
+    train_loader: DataLoader,
+    device: torch.device,
+    config: dict,
+) -> Optional[torch.nn.Module]:
     """
     Train a GZSL classifier on:
     - Real seen-class images (from train_loader)
@@ -127,7 +154,7 @@ def train_gzsl_classifier(
     regenerate_every = config["evaluation"].get("zsl_regenerate_every", 1)
     calibration_mode = gzsl_cfg.get("calibration", "learned_temperature")
 
-    from models.zsl_classifier import ZSLClassifier
+    from src.models.zsl_classifier import ZSLClassifier
 
     base_classifier = ZSLClassifier(num_total).to(device)
     classifier = CalibratedClassifier(base_classifier, num_seen, num_unseen, calibration=calibration_mode).to(device)
@@ -144,8 +171,17 @@ def train_gzsl_classifier(
     patience = 10
     epochs_without_improv = 0
 
-    seen_dataset = train_loader.dataset
-    seen_indices = list(range(len(seen_dataset)))
+    plain_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+    ])
+    plain_seen = FilteredCIFAR100(
+        root=config["paths"]["data_root"], train=True, download=True,
+        transform=plain_transform, allowed_classes=seen_classes,
+    )
+    split_gen = torch.Generator().manual_seed(config["experiment"]["seed"])
+    plain_size = int(0.9 * len(plain_seen))
+    seen_dataset, _ = random_split(plain_seen, [plain_size, len(plain_seen) - plain_size], generator=split_gen)
 
     print("\nTraining GZSL classifier (seen real + synthetic unseen)...")
     for epoch in range(zsl_epochs):
@@ -160,14 +196,19 @@ def train_gzsl_classifier(
                 batch_size=zsl_batch_size,
                 device=device,
             )
+            num_workers = min(config.get("dataset", {}).get("num_workers", 0), 2)
             split_gen = torch.Generator().manual_seed(42)
             synth_train, synth_val = random_split(synth_dataset, [synth_train_size, synth_val_size], generator=split_gen)
-            synth_train_loader = DataLoader(synth_train, batch_size=zsl_batch_size, shuffle=True, num_workers=0)
+            synth_train_loader = DataLoader(synth_train, batch_size=zsl_batch_size, shuffle=True, num_workers=num_workers)
 
-            combined_train_dataset = _CombinedDataset(seen_dataset, synth_train.dataset, num_seen)
-            combined_train_loader = DataLoader(combined_train_dataset, batch_size=zsl_batch_size, shuffle=True, num_workers=0, drop_last=True)
+            shifted_synth = _LabelShiftedDataset(synth_train, num_seen)
+            combined_dataset = ConcatDataset([seen_dataset, shifted_synth])
+            combined_train_loader = DataLoader(
+                combined_dataset, batch_size=zsl_batch_size, shuffle=True,
+                num_workers=num_workers, drop_last=True,
+            )
 
-            synth_val_loader = DataLoader(synth_val, batch_size=100, shuffle=False, num_workers=0)
+            synth_val_loader = DataLoader(synth_val, batch_size=100, shuffle=False, num_workers=num_workers)
 
         classifier.train()
         train_loss = 0
@@ -181,7 +222,8 @@ def train_gzsl_classifier(
 
             optimizer.zero_grad(set_to_none=True)
 
-            if mixup_alpha > 0 and np.random.random() < 0.5:
+            use_mixup = mixup_alpha > 0 and np.random.random() < 0.5
+            if use_mixup:
                 mixed_images, labels_a, labels_b, lam = _mixup_data(images, labels, mixup_alpha)
                 outputs = classifier(mixed_images)
                 loss = lam * criterion(outputs, labels_a) + (1 - lam) * criterion(outputs, labels_b)
@@ -193,10 +235,14 @@ def train_gzsl_classifier(
             optimizer.step()
 
             train_loss += loss.item()
-            _, predicted = outputs.max(1)
-            total += labels.size(0)
-            correct += predicted.eq(labels).sum().item()
-            pbar.set_postfix({"Loss": f"{train_loss / max(1, pbar.n + 1):.4f}", "Acc": f"{100.0 * correct / total:.2f}%"})
+            if not use_mixup:
+                _, predicted = outputs.max(1)
+                total += labels.size(0)
+                correct += predicted.eq(labels).sum().item()
+            pbar.set_postfix({
+                "Loss": f"{train_loss / max(1, pbar.n + 1):.4f}",
+                "Acc": f"{100.0 * correct / max(1, total):.2f}%",
+            })
 
         classifier.eval()
         val_correct = 0
@@ -228,47 +274,20 @@ def train_gzsl_classifier(
     return classifier
 
 
-class _CombinedDataset(Dataset):
-    """Combines real seen-class dataset and synthetic unseen-class dataset into one."""
-
-    def __init__(self, seen_dataset, synth_dataset, seen_class_offset):
-        self.seen_images = []
-        self.seen_labels = []
-        for i in range(len(seen_dataset)):
-            img, label = seen_dataset[i]
-            self.seen_images.append(img)
-            self.seen_labels.append(label)
-
-        self.synth_images = []
-        self.synth_labels = []
-        for i in range(len(synth_dataset)):
-            img, label = synth_dataset[i]
-            self.synth_images.append(img)
-            self.synth_labels.append(label + seen_class_offset)
-
-        self.all_images = self.seen_images + self.synth_images
-        self.all_labels = self.seen_labels + self.synth_labels
-        self.length = len(self.all_images)
-
-    def __len__(self):
-        return self.length
-
-    def __getitem__(self, idx):
-        return self.all_images[idx], self.all_labels[idx]
-
-
 def evaluate_gzsl(
-    classifier,
-    seen_classes,
-    unseen_classes,
-    test_loader,
-    seen_train_loader,
-    class_names,
-    device,
-    results_dir="results",
-):
+    classifier: torch.nn.Module,
+    seen_classes: np.ndarray,
+    unseen_classes: np.ndarray,
+    test_loader: DataLoader,
+    seen_eval_loader: DataLoader,
+    class_names: list,
+    device: torch.device,
+    results_dir: str = "results",
+) -> dict:
     """
     Evaluate GZSL: classifier must predict correctly for both seen and unseen classes.
+
+    Uses held-out seen validation set (not training set) for realistic seen accuracy.
 
     Returns:
         dict with seen_acc, unseen_acc, harmonic_mean, confusion_matrix, etc.
@@ -289,7 +308,7 @@ def evaluate_gzsl(
     per_class_total = [0] * num_total
 
     with torch.no_grad():
-        for images, labels in tqdm(seen_train_loader, desc="Evaluating seen classes"):
+        for images, labels in tqdm(seen_eval_loader, desc="Evaluating seen classes"):
             images, labels = images.to(device), labels.to(device)
             outputs = classifier(images)
             _, predicted = outputs.max(1)
@@ -308,6 +327,7 @@ def evaluate_gzsl(
     with torch.no_grad():
         for images, labels in tqdm(test_loader, desc="Evaluating unseen classes"):
             images, labels = images.to(device), labels.to(device)
+            labels = labels + num_seen
             outputs = classifier(images)
             _, predicted = outputs.max(1)
             batch_size = labels.size(0)
@@ -328,7 +348,10 @@ def evaluate_gzsl(
     harmonic_mean = 2 * seen_acc * unseen_acc / (seen_acc + unseen_acc) if (seen_acc + unseen_acc) > 0 else 0
     overall_acc = 100.0 * all_correct / all_total if all_total > 0 else 0
 
-    per_class_acc = [100.0 * per_class_correct[i] / per_class_total[i] if per_class_total[i] > 0 else 0 for i in range(num_total)]
+    per_class_acc = [
+        100.0 * per_class_correct[i] / per_class_total[i] if per_class_total[i] > 0 else 0
+        for i in range(num_total)
+    ]
     mean_class_acc = float(np.mean([a for a in per_class_acc if a > 0]))
 
     for i in range(num_total):
@@ -363,7 +386,7 @@ def evaluate_gzsl(
     }
 
 
-def plot_gzsl_results(gzsl_metrics, save_dir="results"):
+def plot_gzsl_results(gzsl_metrics: dict, save_dir: str = "results"):
     """Generate GZSL-specific visualizations."""
     import matplotlib.pyplot as plt
 
@@ -386,7 +409,10 @@ def plot_gzsl_results(gzsl_metrics, save_dir="results"):
     ax1.set_title("GZSL: Seen vs Unseen vs Harmonic Mean", fontsize=13, fontweight="bold")
     ax1.grid(True, alpha=0.3, axis="y")
     for bar, val in zip(bars, values):
-        ax1.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1, f"{val:.1f}%", ha="center", fontsize=11, fontweight="bold")
+        ax1.text(
+            bar.get_x() + bar.get_width() / 2, bar.get_height() + 1,
+            f"{val:.1f}%", ha="center", fontsize=11, fontweight="bold",
+        )
 
     ax2 = axes[1]
     num_total = gzsl_metrics["num_seen"] + gzsl_metrics["num_unseen"]

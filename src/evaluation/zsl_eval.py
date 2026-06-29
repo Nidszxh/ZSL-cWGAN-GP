@@ -5,16 +5,17 @@ Uses a pretrained-backbone classifier trained on synthetic unseen-class images.
 """
 
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset, random_split
+from torch.utils.data import DataLoader, Dataset, TensorDataset, random_split
 from torchvision import transforms
 from tqdm import tqdm
 
-from models.zsl_classifier import ZSLClassifier, build_classifier_from_config
+from src.models.zsl_classifier import ZSLClassifier, build_classifier_from_config
 
 zsl_augment = transforms.Compose(
     [
@@ -24,7 +25,15 @@ zsl_augment = transforms.Compose(
 )
 
 
-def _generate_synthetic_data(generator, num_samples, num_classes, semantic_embeddings, nz, batch_size, device):
+def _generate_synthetic_data(
+    generator: torch.nn.Module,
+    num_samples: int,
+    num_classes: int,
+    semantic_embeddings: torch.Tensor,
+    nz: int,
+    batch_size: int,
+    device: torch.device,
+) -> TensorDataset:
     """Per-class balanced synthetic data generation."""
     generator.eval()
     all_images, all_labels = [], []
@@ -48,9 +57,11 @@ def _generate_synthetic_data(generator, num_samples, num_classes, semantic_embed
     return TensorDataset(images, labels)
 
 
-def _mixup_data(images, labels, alpha):
-    if alpha <= 0:
-        return images, labels, labels, 1.0
+def _mixup_data(
+    images: torch.Tensor,
+    labels: torch.Tensor,
+    alpha: float,
+) -> tuple:
     lam = np.random.beta(alpha, alpha)
     index = torch.randperm(images.size(0), device=images.device)
     mixed_images = lam * images + (1 - lam) * images[index]
@@ -58,13 +69,12 @@ def _mixup_data(images, labels, alpha):
 
 
 def train_zsl_classifier(
-    generator,
-    unseen_semantic_embeddings,
-    unseen_classes,
-    test_loader,
-    device,
-    config,
-):
+    generator: torch.nn.Module,
+    unseen_semantic_embeddings: torch.Tensor,
+    unseen_classes: np.ndarray,
+    device: torch.device,
+    config: dict,
+) -> torch.nn.Module:
     num_unseen = len(unseen_classes)
     nz = config["model"]["generator"]["nz"]
     samples_per_class = config["evaluation"]["synthetic_samples_per_class"]
@@ -122,7 +132,8 @@ def train_zsl_classifier(
 
             optimizer.zero_grad(set_to_none=True)
 
-            if mixup_alpha > 0 and np.random.random() < 0.5:
+            use_mixup = mixup_alpha > 0 and np.random.random() < 0.5
+            if use_mixup:
                 mixed_images, labels_a, labels_b, lam = _mixup_data(images, labels, mixup_alpha)
                 outputs = classifier(mixed_images)
                 loss = lam * criterion(outputs, labels_a) + (1 - lam) * criterion(outputs, labels_b)
@@ -134,13 +145,14 @@ def train_zsl_classifier(
             optimizer.step()
 
             train_loss += loss.item()
-            _, predicted = outputs.max(1)
-            total += labels.size(0)
-            correct += predicted.eq(labels).sum().item()
+            if not use_mixup:
+                _, predicted = outputs.max(1)
+                total += labels.size(0)
+                correct += predicted.eq(labels).sum().item()
             pbar.set_postfix(
                 {
                     "Loss": f"{train_loss / max(1, pbar.n + 1):.4f}",
-                    "Acc": f"{100.0 * correct / total:.2f}%",
+                    "Acc": f"{100.0 * correct / max(1, total):.2f}%",
                 }
             )
 
@@ -176,7 +188,14 @@ def train_zsl_classifier(
     return classifier
 
 
-def evaluate_zsl(classifier, test_loader, unseen_classes, class_names, device, results_dir="results"):
+def evaluate_zsl(
+    classifier: torch.nn.Module,
+    test_loader: DataLoader,
+    unseen_classes: np.ndarray,
+    class_names: list,
+    device: torch.device,
+    results_dir: str = "results",
+) -> dict:
     num_unseen = len(unseen_classes)
     classifier.eval()
 

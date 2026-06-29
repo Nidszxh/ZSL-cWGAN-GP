@@ -86,8 +86,9 @@ class WGANGPLoss:
             _, real_features = discriminator(real_images, labels, semantic_embeddings, return_features=True)
             _, fake_features = discriminator(fake_images, labels, semantic_embeddings, return_features=True)
             fm_loss = nn.functional.mse_loss(fake_features, real_features)
-            result["feature_matching_loss"] = fm_loss.item()
-            g_loss = g_loss + feature_matching_weight * fm_loss
+            weighted_fm = feature_matching_weight * fm_loss
+            result["feature_matching_loss"] = weighted_fm.item()
+            g_loss = g_loss + weighted_fm
             result["g_loss"] = g_loss
 
         return result

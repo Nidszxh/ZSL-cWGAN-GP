@@ -14,11 +14,11 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 import torchvision.utils as vutils
 
-from models.generator import Generator
-from models.discriminator import Discriminator
-from utils.embeddings import EmbeddingManager
-from utils.data_loader import get_class_split, get_data_loaders
-from training.losses import WGANGPLoss
+from src.models.generator import Generator
+from src.models.discriminator import Discriminator
+from src.utils.embeddings import EmbeddingManager
+from src.utils.data_loader import get_class_split, get_data_loaders
+from src.training.losses import WGANGPLoss
 from torchvision import datasets
 
 
@@ -30,7 +30,7 @@ def quick_train_test(num_epochs=5):
     print("5-epoch sanity check for the full pipeline")
     print("=" * 70 + "\n")
 
-    config_path = Path("configs/config.yaml")
+    config_path = Path("src/configs/config.yaml")
     if not config_path.exists():
         print("Error: config.yaml not found!")
         return False

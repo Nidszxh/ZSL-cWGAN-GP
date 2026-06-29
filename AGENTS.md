@@ -6,30 +6,32 @@ Zero-Shot Learning with Conditional WGAN-GP on CIFAR-100 using PyTorch. Supports
 
 | Command | Purpose |
 |---|---|
-| `python main.py` | Full training pipeline (CLIP, config-driven, `configs/config.yaml`) |
-| `python ZSLcWGAN-GP.py` | Original monolithic GloVe-based training (legacy) |
-| `python test_training.py` | Quick 5-epoch sanity check (CLIP, no AMP, batch_size=64) |
-| `python test_clip.py` | Standalone CLIP embedding quality tests |
-| `python app.py` | Gradio web demo (requires `checkpoints/best_zsl_classifier.pth`) |
+| `python -m src.main` | Full training pipeline (CLIP, config-driven, `src/configs/config.yaml`) |
+| `python -m src.main --resume <checkpoint>` | Resume training from a saved checkpoint |
+| `python legacy/ZSLcWGAN-GP.py` | Original monolithic GloVe-based training (legacy) |
+| `python -m test.test_training` | Quick 5-epoch sanity check (CLIP, no AMP, batch_size=64) |
+| `python -m test.test_clip` | Standalone CLIP embedding quality tests |
+| `python -m src.app` | Gradio web demo (requires `checkpoints/best_zsl_classifier.pth`) |
 
 ## Key architecture
 
-Modular codebase under `models/`, `utils/`, `training/`, `evaluation/`. The monolithic `ZSLcWGAN-GP.py` (GloVe 300d) is legacy. See `ARCHITECTURE.md` for full data flow and component wiring.
+Modular codebase under `src/models/`, `src/utils/`, `src/training/`, `src/evaluation/`. The monolithic `ZSLcWGAN-GP.py` (GloVe 300d) is legacy. See `ARCHITECTURE.md` for full data flow and component wiring.
 
-- **Generator** (`models/generator.py`): SAGAN self-attention at configurable resolutions (8x8, 16x16), spectral norm, orthogonal init. Semantic projection MLP has spectral norm for stable conditioning. Input: noise + semantic embedding indexed by label.
-- **Discriminator** (`models/discriminator.py`): Projection-based conditional critic, spectral norm. Returns features for feature matching loss when `return_features=True`.
-- **ZSL classifier** (`models/zsl_classifier.py`): Pluggable backbone — ResNet-18 (default, pretrained), EfficientNet-B0, or custom 4-conv CNN. Classifier head: Dropout(0.5) → Linear(512) → ReLU → Dropout(0.3) → Linear(256→num_classes).
-- **GZSL classifier** (`evaluation/gzsl_eval.py`): Trains on real seen + synthetic unseen jointly. `CalibratedClassifier` wrapper learns temperature scaling to reduce seen-class bias. Reports seen/unseen accuracy and harmonic mean.
+- **Generator** (`src/models/generator.py`): SAGAN self-attention at configurable resolutions (8x8, 16x16), spectral norm, orthogonal init. Semantic projection MLP has spectral norm for stable conditioning. Input: noise + semantic embedding indexed by label.
+- **Discriminator** (`src/models/discriminator.py`): Projection-based conditional critic, spectral norm. Returns features for feature matching loss when `return_features=True`. Uses `view(-1)` instead of `squeeze()` for batch_size=1 safety.
+- **ZSL classifier** (`src/models/zsl_classifier.py`): Pluggable backbone — ResNet-18 (default, pretrained), EfficientNet-B0, or custom 4-conv CNN. Classifier head: Dropout(0.5) → Linear(512) → ReLU → Dropout(0.3) → Linear(256→num_classes).
+- **GZSL classifier** (`src/evaluation/gzsl_eval.py`): Trains on real seen + synthetic unseen jointly. `CalibratedClassifier` wrapper learns temperature scaling to reduce seen-class bias. Reports seen/unseen accuracy and harmonic mean. Uses `ConcatDataset` + module-level `_LabelShiftedDataset` for efficient joint training.
 - **Mixed precision**: `torch.amp.GradScaler("cuda")` + `autocast` — enabled via `config['training']['mixed_precision']`.
-- **EMA**: State-dict-based exponential moving average of Generator weights for stable evaluation.
+- **EMA**: State-dict-based exponential moving average of Generator weights (applied/restored in-place around eval code) for stable evaluation.
 - **TTUR**: Discriminator LR (0.0004) is 4x Generator LR (0.0001) for faster convergence.
 
 ## Config
 
-- `configs/config.yaml` drives the modular code. Nested key access: `config['training']['lr_d']`.
-- `ZSLcWGAN-GP.py` has its own flat `config` dict: `config['lr_d']`.
+- `src/configs/config.yaml` drives the modular code. Nested key access: `config['training']['lr_d']`.
+- `legacy/ZSLcWGAN-GP.py` has its own flat `config` dict: `config['lr_d']`.
 - Class split (80 seen / 20 unseen) persisted to `cache/class_split.json`.
-- Setting `embeddings.type` to `"clip"` (768d ViT-L/14) or `"clip_ensemble"` or `"glove"` (300d); model `semantic_dim` must match.
+- Setting `embeddings.type` to `"clip"` (768d ViT-L/14) or `"clip_ensemble"` or `"glove"` (300d) or `"both"` (concatenates CLIP + GloVe); model `semantic_dim` must match.
+- `validate_config()` in `src/main.py` checks all required keys at startup with clear error messages. Missing keys exit immediately instead of failing mid-run.
 
 ## Key gotchas
 
@@ -41,13 +43,20 @@ Modular codebase under `models/`, `utils/`, `training/`, `evaluation/`. The mono
 - **GradScaler**: `scaler.update()` called inside the n_critic loop after each D step (required for AMP state machine with multiple optimizer steps per batch).
 - **`cache/` directory**: auto-generated class split + embeddings pickle; safe to delete for fresh split/embeddings.
 - **`data/`**: auto-downloaded CIFAR-100; `cache/clip/`: auto-downloaded CLIP model weights.
+- **GZSL unseen label offset**: Test loader labels must be shifted by `num_seen` (handled in `src.evaluation.gzsl_eval.evaluate_gzsl`) to match 100-class output.
+- **ZSL/GZSL mixup**: Accuracy is skipped during mixup batches to avoid reporting meaningless numbers.
+- **Feature matching loss**: Logs weighted contribution (not raw MSE) for meaningful curve interpretation.
+- **Noise clamping removed**: `z.clamp(-2, 2)` was eliminated to avoid limiting generation diversity.
+- **Data transforms**: `src/utils/data_loader.py` uses aligned `random_split` on separate train/val datasets with different transforms — no fragile `val_subset.dataset` mutation.
+- **`both` embedding type**: Concatenates CLIP 768-dim + GloVe 300-dim = 1068-dim. Both embedders are initialized (not just GloVe).
+- **Resume**: `--resume <path>` restores G, D, optimizers, schedulers, EMA shadow, and global_step.
 
 ## Useful commands
 
 ```bash
 tensorboard --logdir=runs
-python test_clip.py          # quick CLIP integration check
-python test_training.py      # 5-epoch pipeline sanity check
+python -m test.test_clip          # quick CLIP integration check
+python -m test.test_training      # 5-epoch pipeline sanity check
 pip install -r requirements.txt
 ```
 
@@ -55,17 +64,17 @@ pip install -r requirements.txt
 
 ## Pipeline overview
 
-`main.py` orchestrates:
-1. Load `configs/config.yaml` → set seeds, create dirs
+`src/main.py` orchestrates:
+1. Load `src/configs/config.yaml` → validate → set seeds, create dirs
 2. Split 100 CIFAR-100 classes → 80 seen + 20 unseen (cached in `cache/class_split.json`)
 3. Load CLIP/GloVe embeddings via `EmbeddingManager` (cached in `cache/embeddings_clip.pkl`)
 4. Build `Generator` + `Discriminator` (orthogonal init, spectral norm, SN on semantic proj)
 5. Train GAN: n_critic D steps per G step, WGAN-GP loss, AMP if enabled, feature matching loss, FID eval every N epochs, early stopping. EMA shadow of G used for eval.
 6. Generate synthetic unseen-class images (2000 per class)
 7. Train `ZSLClassifier` (ResNet-18 pretrained backbone) on synthetic data (AdamW, 50 epochs, ReduceLROnPlateau, early stopping patience=10)
-8. Train `GZSLClassifier` on real seen + synthetic unseen jointly with `CalibratedClassifier` (learned temperature scaling)
+8. (_Optional_) Train `GZSLClassifier` on real seen + synthetic unseen jointly with `CalibratedClassifier` (learned temperature scaling)
 9. Evaluate on real unseen-class test set → ZSL Top-1, Top-5, mean class accuracy, confusion matrix
-10. Evaluate on seen + unseen test set → GZSL Seen/Unseen accuracy, Harmonic Mean (H)
+10. (_Optional_) Evaluate on seen + unseen test set → GZSL Seen/Unseen accuracy, Harmonic Mean (H)
 11. Save plots (`training_curves.png`, `metrics_progress.png`, `zsl_confusion_matrix.png`, `gzsl_results.png`, `experiment_summary.png`)
 
 ## Training loop details
@@ -74,11 +83,11 @@ pip install -r requirements.txt
 
 **TTUR**: D gets 4× higher learning rate (0.0004) than G (0.0001) for faster critic convergence. n_critic=5.
 
-**Feature matching loss**: When `feature_matching_weight > 0`, G also minimizes L2 distance between D's intermediate feature maps for real vs fake images.
+**Feature matching loss**: When `feature_matching_weight > 0`, G also minimizes L2 distance between D's intermediate feature maps for real vs fake images. The logged value is the weighted contribution (`feature_matching_weight * fm_loss`), not raw MSE.
 
 **Cosine annealing with warmup**: LR schedule uses linear warmup for first N epochs, then cosine annealing to `min_lr`.
 
-**EMA**: Exponential moving average of G weights (decay=0.999). Shadow weights used for eval/sample generation after `ema_start_epoch`.
+**EMA**: Exponential moving average of G weights (decay=0.999). Shadow weights are applied in-place before eval code and restored after, via `apply_shadow()` / `restore()`.
 
 **Gradient penalty scheduling** (optional): λ_gp ramps from 10 → 20 over first 50 epochs for stricter Lipschitz enforcement over time.
 
@@ -99,7 +108,7 @@ scaler.update()                     # inside n_critic loop, after each D step
 **Training**: `RandomCrop(32,4)` + `RandomHorizontalFlip` + `ColorJitter(0.1)` → `ToTensor()` → `Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))` → output in [-1, 1].
 **Validation/Test**: `ToTensor()` → `Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))`.
 
-Generator outputs via Tanh → [-1, 1] range. When saving to PNG, `(x+1)/2` maps to [0, 1] for `vutils.save_image`. ZSL classifier gets the [-1, 1] tensor directly (matches real data normalization).
+Generator outputs via Tanh → [-1, 1] range. When saving to PNG, `(x+1)/2` maps to [0, 1] for `vutils.save_image`. ZSL classifier gets the [-1, 1] tensor directly (matches real data normalization). Fake PNG images are clamped to [0, 1] before saving.
 
 ## Generator architecture
 
@@ -150,12 +159,14 @@ Trained on synthetic data: 2000 samples/class × 20 unseen classes = 40K total (
 ## GZSL classifier architecture
 
 Same backbone as ZSL classifier but outputs `num_seen + num_unseen` (100) classes. Trained on:
-- Real seen-class images from training set
-- Synthetic unseen-class images from generator
+- Real seen-class images from training set (augmented with RandomCrop + RandomHorizontalFlip)
+- Synthetic unseen-class images from generator (labels shifted by `num_seen` via `_LabelShiftedDataset`)
 
-**CalibratedClassifier** wrapper: Applies learned temperature scaling to separate seen/unseen logits, reducing the bias toward seen classes. Two learnable parameters: `temperature_s` (seen), `temperature_u` (unseen), and `bias_shift`.
+Uses `ConcatDataset` to combine seen + synthetic data without copying tensors.
 
-Evaluates: Seen accuracy, Unseen accuracy, Harmonic mean (H) = `2·S·U / (S + U)`.
+**CalibratedClassifier** wrapper: Applies learned temperature scaling to separate seen/unseen logits, reducing the bias toward seen classes. Three learned parameters: `temperature_s` (seen), `temperature_u` (unseen), and `bias_shift`.
+
+Evaluates: Seen accuracy (on held-out validation set, not training set), Unseen accuracy (on unseen test set with shifted labels), Harmonic mean (H) = `2·S·U / (S + U)`.
 
 ## Evaluation metrics
 
@@ -163,29 +174,33 @@ Evaluates: Seen accuracy, Unseen accuracy, Harmonic mean (H) = `2·S·U / (S + U
 - **IS / KID**: also via `torch-fidelity` alongside FID.
 - **ZSL Top-1 / Top-5**: percentage of correctly classified real unseen-class test images.
 - **ZSL mean class accuracy**: average of per-class accuracies.
-- **GZSL Seen accuracy**: classification accuracy on real seen-class images (100-class output).
-- **GZSL Unseen accuracy**: classification accuracy on real unseen-class images (100-class output).
+- **GZSL Seen accuracy**: classification accuracy on real seen-class images (100-class output, evaluated on val_loader).
+- **GZSL Unseen accuracy**: classification accuracy on real unseen-class images (100-class output, labels shifted by num_seen).
 - **GZSL Harmonic Mean**: `2·seen·unseen / (seen + unseen)` — the primary GZSL metric.
 
 ## Directory structure
 
 ```
-configs/config.yaml          ← single source of truth
-models/                      ← generator.py, discriminator.py, zsl_classifier.py
-training/                    ← trainer.py (loop + EMA), losses.py (WGAN-GP + feature matching)
-evaluation/                  ← gan_eval.py (FID/IS/KID), zsl_eval.py (ZSL), gzsl_eval.py (GZSL)
-utils/                       ← embeddings.py (CLIP/ensemble/GloVe), data_loader.py, metrics.py, visualization.py
-main.py                      ← orchestrator
-app.py                       ← Gradio demo
-ZSLcWGAN-GP.py               ← legacy GloVe (ignore for new work)
-test_training.py             ← 5-epoch sanity
-test_clip.py                 ← CLIP test suite
+src/configs/config.yaml      ← single source of truth
+.pre-commit-config.yaml      ← code quality hooks
+src/models/                  ← generator.py, discriminator.py, zsl_classifier.py
+src/training/                ← trainer.py (loop + EMA + resume), losses.py (WGAN-GP + feature matching)
+src/evaluation/              ← gan_eval.py (FID/IS/KID), zsl_eval.py (ZSL), gzsl_eval.py (GZSL)
+src/utils/                   ← embeddings.py (CLIP/ensemble/GloVe/"both"), data_loader.py, metrics.py, visualization.py
+src/main.py                  ← orchestrator (validate_config, --resume)
+src/app.py                   ← Gradio demo (config-driven backbone)
+legacy/ZSLcWGAN-GP.py        ← legacy GloVe (ignore for new work)
+test/test_training.py        ← 5-epoch sanity
+test/test_clip.py            ← CLIP test suite
+AGENTS.md                    ← this file
+ARCHITECTURE.md              ← full component architecture
+CONTRIBUTING.md              ← contribution guidelines
 cache/                       ← auto-gen: class_split.json, embeddings_*.pkl
-checkpoints/                 ← best_model.pth, best_zsl_classifier.pth, best_gzsl_classifier.pth
+checkpoints/                 ← best_model.pth, best_zsl_classifier.pth, best_gzsl_classifier.pth, checkpoint_epoch_XXX.pth
 results/                     ← real/, fake_epoch*/, unseen_synthetic/, plots
 runs/                        ← TensorBoard logs
 ```
 
 ## Dependencies (from requirements.txt)
 
-Core: torch, torchvision, numpy, scipy, Pillow. Training: tqdm, torch-fidelity, scikit-learn. CLIP: transformers, ftfy, regex. Viz: matplotlib, seaborn, opencv-python. Logging: tensorboard, pyyaml, wandb (optional). Demo: gradio. Quality: pytest, black, flake8, mypy (optional).
+Core: torch, torchvision, numpy, Pillow. Training: tqdm, torch-fidelity, scikit-learn. CLIP: transformers, ftfy, regex. Viz: matplotlib. Logging: tensorboard, pyyaml. Demo: gradio. Dev (optional): pytest.

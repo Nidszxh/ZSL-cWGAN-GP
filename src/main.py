@@ -1,3 +1,4 @@
+import argparse
 import sys
 import warnings
 from pathlib import Path
@@ -10,15 +11,15 @@ import torchvision.utils as vutils
 import yaml
 from torchvision import datasets
 
-from evaluation.gan_eval import compute_fid, save_fake_images, save_real_images
-from evaluation.gzsl_eval import evaluate_gzsl, plot_gzsl_results, train_gzsl_classifier
-from evaluation.zsl_eval import evaluate_zsl, train_zsl_classifier
-from models.discriminator import Discriminator
-from models.generator import Generator
-from training.trainer import train_gan
-from utils.data_loader import get_class_split, get_data_loaders, get_test_loader
-from utils.embeddings import EmbeddingManager
-from utils.visualization import (
+from src.evaluation.gan_eval import compute_fid, save_fake_images, save_real_images
+from src.evaluation.gzsl_eval import evaluate_gzsl, plot_gzsl_results, train_gzsl_classifier
+from src.evaluation.zsl_eval import evaluate_zsl, train_zsl_classifier
+from src.models.discriminator import Discriminator
+from src.models.generator import Generator
+from src.training.trainer import train_gan
+from src.utils.data_loader import get_class_split, get_data_loaders, get_test_loader
+from src.utils.embeddings import EmbeddingManager
+from src.utils.visualization import (
     create_experiment_summary,
     generate_final_sample_grid,
     plot_training_curves,
@@ -40,15 +41,63 @@ def set_seed(seed: int):
     torch.backends.cudnn.benchmark = False
 
 
+def validate_config(config: dict) -> None:
+    """Validate required config keys exist with sensible values."""
+    required_paths = {
+        "paths": ["data_root", "results_dir", "checkpoints_dir", "cache_dir"],
+        "dataset": ["num_classes", "seen_classes", "unseen_classes"],
+        "embeddings": ["type"],
+        "model.generator": ["nz", "ngf", "nc", "semantic_proj_dim"],
+        "model.discriminator": ["ndf", "nc", "semantic_proj_dim"],
+        "model.classifier": ["backbone"],
+        "training": ["num_epochs", "batch_size", "lr_g", "lr_d", "n_critic", "lambda_gp"],
+    }
+    errors = []
+    for section, keys in required_paths.items():
+        parent = config
+        for part in section.split("."):
+            if isinstance(parent, dict):
+                parent = parent.get(part, {})
+        if not isinstance(parent, dict):
+            errors.append(f"Missing config section: {section}")
+            continue
+        for key in keys:
+            if key not in parent:
+                errors.append(f"Missing config key: {section}.{key}")
+
+    embed_type = config.get("embeddings", {}).get("type", "")
+    if embed_type in ("clip", "clip_ensemble"):
+        if not config.get("embeddings", {}).get("clip_model"):
+            errors.append("embeddings.clip_model required for clip/clip_ensemble")
+
+    if errors:
+        for e in errors:
+            print(f"Config error: {e}")
+        sys.exit(1)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="ZSL-cWGAN-GP Training")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Resume from checkpoint path (e.g. checkpoints/checkpoint_epoch_050.pth)")
+    parser.add_argument("--config", type=str, default="src/configs/config.yaml",
+                        help="Path to config file")
+    return parser.parse_args()
+
+
 def main():
-    config_path = Path("configs/config.yaml")
+    args = parse_args()
+    config_path = Path(args.config)
     if not config_path.exists():
-        print("Error: configs/config.yaml not found")
+        print(f"Error: {args.config} not found")
         sys.exit(1)
 
     with open(config_path) as f:
         config = yaml.safe_load(f)
 
+    config["resume_path"] = args.resume
+
+    validate_config(config)
     set_seed(config["experiment"]["seed"])
     device = torch.device(config["experiment"]["device"])
     print(f"Using device: {device}")
@@ -116,8 +165,11 @@ def main():
     if not Path(real_images_dir, "real_00000.png").exists():
         save_real_images(val_loader.dataset, save_dir=real_images_dir)
 
-    # Train
-    tracker = train_gan(netG, netD, train_loader, seen_embeddings, device, config, real_images_dir)
+    # Train (with optional resume)
+    tracker = train_gan(
+        netG, netD, train_loader, seen_embeddings, device, config, real_images_dir,
+        resume_path=config.get("resume_path"),
+    )
 
     # Post-training plots
     print("\nGenerating training visualizations...")
@@ -172,10 +224,9 @@ def main():
     with torch.no_grad():
         for i, unseen_class_idx in enumerate(unseen_classes):
             z = torch.randn(samples_per_class, gen_cfg["nz"], device=device)
-            z = torch.clamp(z, -2, 2)
             labels = torch.full((samples_per_class,), i, device=device)
             fake_imgs = netG(z, labels, unseen_embeddings)
-            fake_imgs = (fake_imgs + 1) / 2
+            fake_imgs = ((fake_imgs + 1) / 2).clamp(0, 1)
             class_dir = save_dir / f"{i:02d}_{class_names[unseen_class_idx]}"
             class_dir.mkdir(parents=True, exist_ok=True)
 
@@ -192,9 +243,9 @@ def main():
     print("ZERO-SHOT LEARNING EVALUATION")
     print("=" * 70)
 
-    test_loader, test_class_info = get_test_loader(config, unseen_classes)
+    test_loader, _ = get_test_loader(config, unseen_classes)
     classifier = train_zsl_classifier(
-        netG, unseen_embeddings, unseen_classes, test_loader, device, config
+        netG, unseen_embeddings, unseen_classes, device, config
     )
     zsl_metrics = evaluate_zsl(
         classifier,
@@ -212,6 +263,8 @@ def main():
     # GZSL Evaluation (seen + unseen classes)
     # =====================================================
     gzsl_cfg = config["evaluation"].get("gzsl", {})
+    gzsl_classifier = None
+    gzsl_metrics = None
     if gzsl_cfg.get("enabled", False):
         print("\n" + "=" * 70)
         print("GENERALIZED ZERO-SHOT LEARNING (GZSL) EVALUATION")
@@ -224,7 +277,6 @@ def main():
             seen_classes=seen_classes,
             unseen_classes=unseen_classes,
             train_loader=train_loader,
-            test_loader=test_loader,
             device=device,
             config=config,
         )
@@ -235,7 +287,7 @@ def main():
                 seen_classes=seen_classes,
                 unseen_classes=unseen_classes,
                 test_loader=test_loader,
-                seen_train_loader=train_loader,
+                seen_eval_loader=val_loader,
                 class_names=class_names,
                 device=device,
                 results_dir=config["paths"]["results_dir"],
@@ -250,6 +302,7 @@ def main():
         zsl_metrics,
         final_metrics["fid"],
         config,
+        gzsl_metrics=gzsl_metrics,
         save_dir=config["paths"]["results_dir"],
     )
 

@@ -1,12 +1,15 @@
 from pathlib import Path
+from typing import Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torchvision.utils as vutils
 
+from src.utils.metrics import MetricsTracker
 
-def plot_training_curves(tracker, save_dir: str = "results"):
+
+def plot_training_curves(tracker: MetricsTracker, save_dir: str = "results"):
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
 
     ax1.plot(tracker.g_losses, label="G Loss", alpha=0.7)
@@ -31,7 +34,7 @@ def plot_training_curves(tracker, save_dir: str = "results"):
     plt.close()
 
 
-def plot_metrics_progress(tracker, save_dir: str = "results"):
+def plot_metrics_progress(tracker: MetricsTracker, save_dir: str = "results"):
     if not tracker.metrics_history:
         return
 
@@ -61,7 +64,15 @@ def plot_metrics_progress(tracker, save_dir: str = "results"):
     plt.close()
 
 
-def save_sample_grid(generator, fixed_noise, fixed_labels, seen_embeddings, epoch, device, save_dir: str = "results"):
+def save_sample_grid(
+    generator: torch.nn.Module,
+    fixed_noise: torch.Tensor,
+    fixed_labels: torch.Tensor,
+    seen_embeddings: torch.Tensor,
+    epoch: int,
+    device: torch.device,
+    save_dir: str = "results",
+) -> torch.Tensor:
     generator.eval()
     with torch.no_grad():
         fake_samples = generator(fixed_noise, fixed_labels, seen_embeddings).cpu()
@@ -78,7 +89,7 @@ def save_sample_grid(generator, fixed_noise, fixed_labels, seen_embeddings, epoc
     return grid
 
 
-def plot_zsl_confusion_matrix(zsl_metrics, save_dir: str = "results"):
+def plot_zsl_confusion_matrix(zsl_metrics: dict, save_dir: str = "results"):
     cm = zsl_metrics["confusion_matrix"]
     num_classes = len(cm)
     class_labels = zsl_metrics["class_names"]
@@ -99,7 +110,7 @@ def plot_zsl_confusion_matrix(zsl_metrics, save_dir: str = "results"):
     plt.close()
 
 
-def plot_zsl_class_accuracy(zsl_metrics, save_dir: str = "results"):
+def plot_zsl_class_accuracy(zsl_metrics: dict, save_dir: str = "results"):
     per_class_acc = zsl_metrics["per_class_accuracy"]
     class_labels = zsl_metrics["class_names"]
     mean_acc = zsl_metrics["mean_class_accuracy"]
@@ -127,7 +138,14 @@ def plot_zsl_class_accuracy(zsl_metrics, save_dir: str = "results"):
     plt.close()
 
 
-def create_experiment_summary(tracker, zsl_metrics, final_fid, config, save_dir: str = "results", gzsl_metrics=None):
+def create_experiment_summary(
+    tracker: MetricsTracker,
+    zsl_metrics: dict,
+    final_fid: float,
+    config: dict,
+    gzsl_metrics: Optional[dict] = None,
+    save_dir: str = "results",
+):
     fig = plt.figure(figsize=(18, 12))
     gs = fig.add_gridspec(3, 3, hspace=0.3, wspace=0.3)
 
@@ -253,7 +271,18 @@ Training:
     plt.close()
 
 
-def generate_final_sample_grid(generator, device, num_seen_classes, seen_embeddings, class_names, class_info, nz: int = 128, n_rows: int = 4, n_cols: int = 5, save_dir: str = "results"):
+def generate_final_sample_grid(
+    generator: torch.nn.Module,
+    device: torch.device,
+    num_seen_classes: int,
+    seen_embeddings: torch.Tensor,
+    class_names: list,
+    class_info: dict,
+    nz: int = 128,
+    n_rows: int = 4,
+    n_cols: int = 5,
+    save_dir: str = "results",
+):
     generator.eval()
     noise = torch.randn(n_rows * n_cols, nz, device=device)
     labels = torch.tensor([i % num_seen_classes for i in range(n_rows * n_cols)], device=device)

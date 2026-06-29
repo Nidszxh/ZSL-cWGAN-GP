@@ -1,14 +1,18 @@
 from pathlib import Path
-from typing import Union
+from typing import Optional, Union
 
 import torch
 import torchvision.utils as vutils
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 from torch_fidelity import calculate_metrics
 
 
-def save_real_images(dataset, num_samples: int = 5000, save_dir: str = "results/real"):
+def save_real_images(
+    dataset: Dataset,
+    num_samples: int = 5000,
+    save_dir: str = "results/real",
+) -> str:
     save_path = Path(save_dir)
     save_path.mkdir(parents=True, exist_ok=True)
 
@@ -18,7 +22,7 @@ def save_real_images(dataset, num_samples: int = 5000, save_dir: str = "results/
     print(f"Saving {num_samples} real images for evaluation...")
     with torch.no_grad():
         for images, _ in tqdm(loader, desc="Saving real images"):
-            images = (images + 1) / 2
+            images = ((images + 1) / 2).clamp(0, 1)
             for img in images:
                 if count >= num_samples:
                     break
@@ -41,7 +45,7 @@ def save_fake_images(
     nz: int = 128,
     num_seen_classes: int = 80,
     save_dir: str = None,
-):
+) -> str:
     if save_dir is None:
         save_dir = f"results/fake_epoch{epoch}"
     save_path = Path(save_dir)
@@ -59,7 +63,7 @@ def save_fake_images(
             z = torch.randn(curr_bs, nz, device=device)
             labels = torch.randint(0, num_seen_classes, (curr_bs,), device=device)
             fake_images = generator(z, labels, seen_embeddings).cpu()
-            fake_images = (fake_images + 1) / 2
+            fake_images = ((fake_images + 1) / 2).clamp(0, 1)
 
             for j, img in enumerate(fake_images):
                 vutils.save_image(img, save_path / f"fake_{i + j:05d}.png")
@@ -69,7 +73,7 @@ def save_fake_images(
     return save_dir
 
 
-def compute_fid(real_dir: str, fake_dir: str) -> dict:
+def compute_fid(real_dir: str, fake_dir: str) -> dict[str, float]:
     print(f"Calculating metrics between {real_dir} and {fake_dir}")
     try:
         metrics = calculate_metrics(
