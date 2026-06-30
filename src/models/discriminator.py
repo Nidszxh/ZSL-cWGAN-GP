@@ -129,7 +129,7 @@ def test_gan_pair():
     print("Testing Generator + Discriminator Pair")
     print("=" * 70)
 
-    from models.generator import Generator
+    from src.models.generator import Generator
 
     # Configuration
     batch_size = 8
