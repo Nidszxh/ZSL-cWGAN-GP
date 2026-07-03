@@ -2,7 +2,7 @@
 Gradio Demo for ZSL-cWGAN-GP
 
 Requires a trained model checkpoint at checkpoints/best_zsl_classifier.pth.
-Run `python main.py` first to train one, then launch this demo.
+Run `python -m src.main` first to train one, then launch this demo.
 """
 
 import json
@@ -17,9 +17,9 @@ import torch
 import torchvision.transforms as transforms
 import yaml
 from PIL import Image
-from torchvision import datasets
 
 from src.models.zsl_classifier import build_classifier_from_config
+from src.utils.data_loader import get_class_names
 
 warnings.filterwarnings("ignore", message=".*align should be passed as Python or NumPy boolean.*")
 
@@ -32,7 +32,7 @@ def load_model(config_path: str = "src/configs/config.yaml"):
 
     split_file = Path(config["paths"]["cache_dir"]) / "class_split.json"
     if not split_file.exists():
-        return None, None, device, config
+        return None, None, device
 
     with open(split_file) as f:
         split_data = json.load(f)
@@ -40,25 +40,25 @@ def load_model(config_path: str = "src/configs/config.yaml"):
 
     ckpt_path = Path(config["paths"]["checkpoints_dir"]) / "best_zsl_classifier.pth"
     if not ckpt_path.exists():
-        return None, None, device, config
+        return None, None, device
 
     num_unseen = len(unseen_indices)
     classifier = build_classifier_from_config(num_unseen, config).to(device)
     classifier.load_state_dict(torch.load(ckpt_path, map_location=device, weights_only=True))
     classifier.eval()
 
-    cifar100 = datasets.CIFAR100(root=config["paths"]["data_root"], download=True)
-    unseen_class_names = [cifar100.classes[i] for i in unseen_indices]
+    class_names = get_class_names(config["paths"]["data_root"])
+    unseen_class_names = [class_names[i] for i in unseen_indices]
 
-    return classifier, unseen_class_names, device, config
+    return classifier, unseen_class_names, device
 
 
-CLASSIFIER, CLASS_NAMES, DEVICE, CONFIG = None, None, None, None
+CLASSIFIER, CLASS_NAMES, DEVICE = None, None, None
 
 
 def initialize():
-    global CLASSIFIER, CLASS_NAMES, DEVICE, CONFIG
-    CLASSIFIER, CLASS_NAMES, DEVICE, CONFIG = load_model()
+    global CLASSIFIER, CLASS_NAMES, DEVICE
+    CLASSIFIER, CLASS_NAMES, DEVICE = load_model()
     return CLASSIFIER is not None
 
 
@@ -136,7 +136,7 @@ with gr.Blocks(title="ZSL-cWGAN-GP Demo") as demo:
         - **Device:** {DEVICE}
         """)
     else:
-        gr.Warning("No trained model found. Run `python main.py` first.")
+        gr.Warning("No trained model found. Run `python -m src.main` first.")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,5 @@
 # Experiment
 experiment:
-  name: "zsl-cwgan-gp"
   seed: 42
   device: "cuda"  # Options: "cuda", "cpu"
 
@@ -14,27 +13,16 @@ paths:
 
 # Dataset
 dataset:
-  name: "CIFAR100"
   num_classes: 100
   seen_classes: 80
-  unseen_classes: 20
-  image_size: 32
-  num_workers: 2
+  num_workers: 4
 
 # Semantic Embeddings
 embeddings:
-  type: "clip"  # Options: "clip", "glove", "both", "clip_ensemble"
-  clip_model: "openai/clip-vit-large-patch14"  # Upgraded to ViT-L/14 (768-dim)
-  clip_models_ensemble:
-    - "openai/clip-vit-base-patch32"      # 512-dim
-    - "openai/clip-vit-large-patch14"     # 768-dim
+  type: "clip"  # CLIP-only (ViT-L/14, 768-dim)
+  clip_model: "openai/clip-vit-large-patch14"  # 768-dim
   clip_cache_dir: "./cache/clip"
-  embedding_dim: 768  # ViT-L/14 dimension
   normalize: true  # Normalize embeddings
-  
-  # GloVe (legacy, for comparison)
-  glove_path: "glove.6B.300d.txt"
-  glove_dim: 300
 
 # Model Architecture
 model:
@@ -46,24 +34,18 @@ model:
     semantic_proj_dim: 256  # Projection dimension for semantic features
     dropout: 0.2
     use_spectral_norm_semantic: true  # Spectral norm on semantic projection MLP
-    use_adain: false  # AdaIN instead of BatchNorm (experimental)
     attention_resolutions: [8, 16]  # Self-attention at 8x8 and 16x16
-    noise_injection: false  # StyleGAN-style noise injection
   
   # Discriminator
   discriminator:
     ndf: 64  # Base channel multiplier
     nc: 3
     semantic_proj_dim: 256
-    use_feature_matching: true  # Enable feature matching loss
-    use_auxiliary_classification: false  # AC-GAN style auxiliary head
-    num_aux_classes: 80  # Number of seen classes for aux head
 
   # ZSL/GZSL Classifier
   classifier:
     backbone: "resnet18"  # Options: "resnet18", "efficientnet_b0", "custom"
-    pretrained: true
-    freeze_backbone: false
+    pretrained: false  # True expects ImageNet-normalized inputs; data is [-1,1] so random init
     dropout: 0.5
     hidden_dim: 512
 
@@ -72,6 +54,7 @@ training:
   num_epochs: 150
   batch_size: 128
   mixed_precision: true               # FP16 for ~2x speedup on Tensor Cores
+  compile: false                      # "default" or "reduce-overhead" to torch.compile G/D (smoke-test GP first)
 
   # Optimization - TTUR: D LR > G LR
   lr_g: 0.0001
@@ -107,22 +90,16 @@ training:
 
   early_stopping_patience: 20
 
-  # Gradient Accumulation (for effective larger batch sizes)
-  gradient_accumulation_steps: 1
-
 evaluation:
   # GAN Metrics
-  fid_samples: 20000  # Number of samples for FID calculation
-  calculate_is: true
-  calculate_kid: true
-  use_clean_fid: false  # Use clean-fid if available
-  
+  fid_samples: 4000  # Matches the 4,000-image seen val subset (equal real/fake counts)
+
   # ZSL/GZSL Metrics
   synthetic_samples_per_class: 2000
   zsl_epochs: 50
   zsl_lr: 0.001
   zsl_batch_size: 128
-  zsl_regenerate_every: 1       # Regenerate synthetic data every N ZSL epochs (1 = every epoch)
+  zsl_regenerate_every: 5       # Regenerate synthetic data every N ZSL epochs (1 = every epoch)
   zsl_mixup_alpha: 0.2          # Mixup alpha (0 = disabled)
   zsl_label_smoothing: 0.1      # Label smoothing for CrossEntropyLoss
   
@@ -130,17 +107,3 @@ evaluation:
   gzsl:
     enabled: true
     calibration: "learned_temperature"  # Options: "none", "fixed", "learned_temperature"
-    calibration_temperature: 1.0  # Fixed temperature if calibration="fixed"
-    seen_weight: 1.0  # Weight for seen class loss
-    unseen_weight: 1.0  # Weight for unseen class loss
-    harmonic_mean: true  # Report harmonic mean of seen/unseen accuracy
-    pseudo_labeling: false  # Iterative pseudo-labeling on real unseen
-    pseudo_label_threshold: 0.9  # Confidence threshold for pseudo-labels
-
-logging:
-  use_tensorboard: true
-  use_wandb: false               # Set true if using W&B
-  wandb_project: "zsl-cwgan-gp"
-  wandb_entity: null             # Your W&B username
-  log_interval: 50               # Log every N iterations
-  save_samples: true

@@ -38,7 +38,6 @@ python -m test.test_training     # 5-epoch pipeline sanity
 | `src/models/` | Generator, Discriminator, ZSL classifier |
 | `src/training/` | GAN training loop (EMA, resume), WGAN-GP + feature matching losses |
 | `src/evaluation/` | FID, ZSL classifier, GZSL calibrated stacking |
-| `src/utils/` | Embeddings (CLIP/ensemble/GloVe), data loading, metrics tracker, visualization |
+| `src/utils/` | CLIP embeddings, data loading, metrics tracker, visualization |
 | `src/configs/` | YAML configuration (validated at startup) |
 | `test/` | Sanity checks and test suites |
-| `legacy/` | Original monolithic GloVe-based implementation |

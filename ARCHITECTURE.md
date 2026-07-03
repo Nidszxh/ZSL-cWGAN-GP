@@ -2,7 +2,7 @@
 
 ## Overview
 
-ZSL-cWGAN-GP is a conditional generative adversarial network that synthesizes CIFAR-100 images conditioned on semantic text embeddings (CLIP or GloVe). The trained generator produces images for unseen classes, which are used to train a zero-shot classifier. An optional Generalized Zero-Shot Learning (GZSL) branch additionally classifies seen classes with calibrated temperature scaling to reduce seen-bias.
+ZSL-cWGAN-GP is a conditional generative adversarial network that synthesizes CIFAR-100 images conditioned on CLIP semantic text embeddings. The trained generator produces images for unseen classes, which are used to train a zero-shot classifier. An optional Generalized Zero-Shot Learning (GZSL) branch additionally classifies seen classes with calibrated temperature scaling to reduce seen-bias.
 
 ---
 
@@ -30,17 +30,13 @@ CIFAR-100 (100 classes)
 ```
 CIFAR-100 class names
     │
-    ├── CLIPTextEmbedder: "openai/clip-vit-large-patch14" → 768-dim
-    │   - Uses 5 prompt templates per class, averages them
-    │   - L2-normalizes output
-    │   - Optional ensemble: multiple CLIP models averaged
-    │   - "both" mode concatenates CLIP + GloVe embeddings
-    │
-    └── GloVeEmbedder: glove.6B.300d.txt → 300-dim
-        - Falls back to word averaging, then random if missing
+    └── CLIPTextEmbedder: "openai/clip-vit-large-patch14" → 768-dim
+        - Uses 5 prompt templates per class, averages them
+        - L2-normalizes output
+        - Cached to cache/embeddings_clip.pkl
 ```
 
-Both produce a tensor `[num_classes, embedding_dim]` that the GAN indexes by label at runtime.
+This produces a tensor `[num_classes, embedding_dim]` that the GAN indexes by label at runtime.
 
 ---
 
@@ -55,7 +51,7 @@ semantic_emb[labels]   │            8*4*4           4x4      4→8      8x8   
             (LeakyReLU+Dropout)
 ```
 
-**Semantic projection**: 2-layer MLP (768→256→256 for CLIP, 300→256→256 for GloVe) with LeakyReLU(0.2), Dropout(0.2), and spectral norm.
+**Semantic projection**: 2-layer MLP (768→256→256 for CLIP) with LeakyReLU(0.2), Dropout(0.2), and spectral norm.
 
 **Self-attention**: SAGAN-style block at configurable resolutions (default 8x8, optional 16x16) with spectral norm Q/K/V projections. Initialized with `gamma=0` so training starts as identity and gradually learns global dependencies.
 
@@ -84,6 +80,10 @@ semantic_emb[labels]    │
 
 Uses `view(-1)` instead of `squeeze()` for batch_size=1 safety.
 
+**Bias-free critic (L1-F18)**: all convs and linears are `bias=False`. Spectral norm and the gradient penalty constrain weights and gradients, but neither constrains the critic's *absolute* output — learnable biases (additive constants invisible to both constraints) compounded through the LeakyReLU stack and inflated D(real)≈D(fake) to +1.7M with W frozen at ~-10, until float32 overflow collapsed training (validated: final G -1.67M → -9.8 after the fix). Bias-free pins D(0)=0, so |D(x)| ≤ ‖x‖·Lipschitz is bounded for the whole run.
+
+**Lipschitz mechanisms (L1-F11 note)**: every conv, the output conv, and `embed_output` are spectral-normed, AND the loss adds a WGAN-GP penalty — two redundant Lipschitz constraints. This is a deliberate, non-standard choice vs. the plain-conv f-CLSWGAN baseline (which relies on the GP alone). The two interact: SN keeps each layer's operator norm at 1 (bounded scores), the GP enforces the global 1-Lipschitz constraint on the interpolated line. Keep them together — removing either one changes the Lipschitz regime and requires re-tuning (LR, λ_gp, grad_clip) and is out of scope for a paper ablation unless that re-tuning is reported.
+
 ---
 
 ### 4. WGAN-GP Training Loop
@@ -103,7 +103,7 @@ for each batch:
     update G with Adam(β₁=0.0, β₂=0.9)
 ```
 
-**Key parameters** (from `configs/config.yaml`):
+**Key parameters** (from `src/configs/config.yaml`):
 
 | Parameter | Value | Purpose |
 |---|---|---|
@@ -130,7 +130,7 @@ for each batch:
 
 ---
 
-### 5. Zero-Shot Classifier (`models/zsl_classifier.py`)
+### 5. Zero-Shot Classifier (`src/models/zsl_classifier.py`)
 
 A pluggable backbone classifier trained on synthetic images from the generator:
 
@@ -141,10 +141,10 @@ input [3, 32, 32]
            Dropout(0.5) → Linear(feat_dim→512) → ReLU → Dropout(0.3) → Linear(512→num_classes)
 ```
 
-**Backbone options**:
-- **ResNet-18** (default): Pretrained on ImageNet, ~11.4M params, 512-dim features
-- **EfficientNet-B0**: Pretrained on ImageNet, ~4.7M params, 1280-dim features
-- **Custom CNN** (legacy): 4× Conv2D (64→128→256→512) + AdaptiveAvgPool2d, ~3.0M params
+**Backbone options** (randomly initialized by default — `model.classifier.pretrained: false`, since classifier inputs are [-1, 1]-normalized while ImageNet weights expect (0.485, 0.229, 0.225); set `true` only if you also apply ImageNet normalization to classifier inputs):
+- **ResNet-18** (default): ~11.4M params, 512-dim features
+- **EfficientNet-B0**: ~4.7M params, 1280-dim features
+- **Custom CNN**: 4× Conv2D (64→128→256→512) + AdaptiveAvgPool2d, ~3.0M params
 
 Strong dropout (0.5 on stem, 0.3 on head) prevents overfitting on limited synthetic data.
 
@@ -160,7 +160,7 @@ Trained for up to 50 epochs on synthetic unseen data (2000 images/class) with:
 
 ---
 
-### 6. GZSL Classifier (`evaluation/gzsl_eval.py`)
+### 6. GZSL Classifier (`src/evaluation/gzsl_eval.py`)
 
 Generalized Zero-Shot Learning extends ZSL to also classify seen classes:
 
@@ -180,7 +180,7 @@ Generalized Zero-Shot Learning extends ZSL to also classify seen classes:
 
 | Metric | How |
 |---|---|
-| **FID** | `torch-fidelity` between saved real/fake PNGs (20K samples per eval) |
+| **FID** | `torch-fidelity` between saved real/fake PNGs (4K samples per eval, equal counts) |
 | **IS** | Inception Score via torch-fidelity |
 | **KID** | Kernel ID via torch-fidelity |
 | **ZSL Top-1** | % correct on real unseen test set |
@@ -195,31 +195,33 @@ Generalized Zero-Shot Learning extends ZSL to also classify seen classes:
 ## File Map
 
 ```
-configs/config.yaml          ← single source of truth for all hyperparameters
-.pre-commit-config.yaml      ← code quality hooks (black, flake8, mypy)
-models/generator.py          ← G(z, labels, embeddings) → images
-models/discriminator.py      ← D(images, labels, embeddings) → score
-models/zsl_classifier.py     ← CNN trained on synthetic unseen data
-training/losses.py           ← WGAN-GP loss + gradient penalty + feature matching
-training/trainer.py          ← epoch loop, EMA, checkpointing, AMP, resume
-evaluation/gan_eval.py       ← FID/IS/KID via torch-fidelity
-evaluation/zsl_eval.py       ← synthetic dataset, classifier training, ZSL metrics
-evaluation/gzsl_eval.py      ← GZSL training, calibrated stacking, seen+unseen eval
-utils/embeddings.py          ← CLIP / CLIP ensemble / GloVe embedding extraction ("both" mode)
-utils/data_loader.py         ← CIFAR-100 with seen/unseen split + aligned train/val transforms
-utils/metrics.py             ← MetricsTracker (losses, FID history)
-utils/visualization.py       ← all plotting (curves, grids, confusion matrix, experiment summary)
-main.py                      ← orchestrates everything (config validation, --resume)
-app.py                       ← Gradio demo (config-driven backbone)
+src/configs/config.yaml        ← single source of truth for all hyperparameters
+.pre-commit-config.yaml        ← code quality hooks (black, flake8, mypy)
+src/models/generator.py        ← G(z, labels, embeddings) → images
+src/models/discriminator.py    ← D(images, labels, embeddings) → score
+src/models/zsl_classifier.py   ← CNN trained on synthetic unseen data
+src/training/losses.py         ← WGAN-GP loss + gradient penalty + feature matching
+src/training/trainer.py        ← epoch loop, EMA, checkpointing, AMP, resume
+src/evaluation/gan_eval.py     ← FID/IS/KID via torch-fidelity
+src/evaluation/zsl_eval.py     ← synthetic dataset, classifier training, ZSL metrics
+src/evaluation/gzsl_eval.py    ← GZSL training, calibrated stacking, seen+unseen eval
+src/utils/embeddings.py        ← CLIP text embedding extraction (cached)
+src/utils/data_loader.py       ← CIFAR-100 with seen/unseen split + aligned train/val transforms
+src/utils/metrics.py           ← MetricsTracker (losses, FID history)
+src/utils/visualization.py     ← all plotting (curves, grids, confusion matrix, experiment summary)
+src/main.py                    ← orchestrates everything (config validation, --resume)
+src/app.py                     ← Gradio demo (config-driven backbone)
+test/test_training.py          ← 5-epoch sanity check
+test/test_clip.py              ← CLIP embedding test suite
 ```
 
 ## Config Validation
 
-`validate_config(config)` in `main.py` checks all required config keys at startup and exits with clear error messages if any are missing. Keys validated include:
+`validate_config(config)` in `src/main.py` checks all required config keys at startup and exits with clear error messages if any are missing. Keys validated include:
 
 - `paths`: data_root, results_dir, checkpoints_dir, cache_dir
-- `dataset`: num_classes, seen_classes, unseen_classes
-- `embeddings`: type (and clip_model if type is clip/clip_ensemble)
+- `dataset`: num_classes, seen_classes
+- `embeddings`: type (must be "clip") and clip_model
 - `model.generator`: nz, ngf, nc, semantic_proj_dim
 - `model.discriminator`: ndf, nc, semantic_proj_dim
 - `model.classifier`: backbone

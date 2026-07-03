@@ -27,37 +27,42 @@ class Discriminator(nn.Module):
 
         # Semantic projection network
         self.semantic_proj = nn.Sequential(
-            spectral_norm(nn.Linear(semantic_dim, semantic_proj_dim)), nn.LeakyReLU(0.2, inplace=True), spectral_norm(nn.Linear(semantic_proj_dim, semantic_proj_dim)), nn.LeakyReLU(0.2, inplace=True)
+            spectral_norm(nn.Linear(semantic_dim, semantic_proj_dim, bias=False)),
+            nn.LeakyReLU(0.2, inplace=True),
+            spectral_norm(nn.Linear(semantic_proj_dim, semantic_proj_dim, bias=False)),
+            nn.LeakyReLU(0.2, inplace=True),
         )
 
         # Image feature extraction
         # 32x32 -> 16x16 -> 8x8 -> 4x4
+        # L1-F18: bias-free critic — learnable biases let D inflate an unbounded
+        # offset (observed +1.7M) that WGAN-GP cannot constrain; this pins D(0)=0.
         self.features = nn.Sequential(
             # 32x32 -> 16x16
-            spectral_norm(nn.Conv2d(nc, ndf, 3, 1, 1)),
+            spectral_norm(nn.Conv2d(nc, ndf, 3, 1, 1, bias=False)),
             nn.LeakyReLU(0.2, inplace=True),
-            spectral_norm(nn.Conv2d(ndf, ndf, 4, 2, 1)),
+            spectral_norm(nn.Conv2d(ndf, ndf, 4, 2, 1, bias=False)),
             nn.LeakyReLU(0.2, inplace=True),
             # 16x16 -> 8x8
-            spectral_norm(nn.Conv2d(ndf, ndf * 2, 3, 1, 1)),
+            spectral_norm(nn.Conv2d(ndf, ndf * 2, 3, 1, 1, bias=False)),
             nn.LeakyReLU(0.2, inplace=True),
-            spectral_norm(nn.Conv2d(ndf * 2, ndf * 2, 4, 2, 1)),
+            spectral_norm(nn.Conv2d(ndf * 2, ndf * 2, 4, 2, 1, bias=False)),
             nn.LeakyReLU(0.2, inplace=True),
             # 8x8 -> 4x4
-            spectral_norm(nn.Conv2d(ndf * 2, ndf * 4, 3, 1, 1)),
+            spectral_norm(nn.Conv2d(ndf * 2, ndf * 4, 3, 1, 1, bias=False)),
             nn.LeakyReLU(0.2, inplace=True),
-            spectral_norm(nn.Conv2d(ndf * 4, ndf * 4, 4, 2, 1)),
+            spectral_norm(nn.Conv2d(ndf * 4, ndf * 4, 4, 2, 1, bias=False)),
             nn.LeakyReLU(0.2, inplace=True),
             # 4x4 (keep spatial dimensions)
-            spectral_norm(nn.Conv2d(ndf * 4, ndf * 8, 3, 1, 1)),
+            spectral_norm(nn.Conv2d(ndf * 4, ndf * 8, 3, 1, 1, bias=False)),
             nn.LeakyReLU(0.2, inplace=True),
         )
 
         # Unconditional output
-        self.output = spectral_norm(nn.Conv2d(ndf * 8, 1, 4, 1, 0))
+        self.output = spectral_norm(nn.Conv2d(ndf * 8, 1, 4, 1, 0, bias=False))
 
         # Conditional projection
-        self.embed_output = spectral_norm(nn.Linear(semantic_proj_dim, ndf * 8))
+        self.embed_output = spectral_norm(nn.Linear(semantic_proj_dim, ndf * 8, bias=False))
 
         # Initialize weights
         self.apply(self._init_weights)
@@ -67,9 +72,6 @@ class Discriminator(nn.Module):
             nn.init.orthogonal_(m.weight)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
-
-    def forward_features(self, x):
-        return self.features(x)
 
     def forward(self, x, labels, semantic_embeddings, return_features=False):
         h = self.features(x)  # [B, ndf*8, 4, 4]
@@ -86,99 +88,3 @@ class Discriminator(nn.Module):
         if return_features:
             return output + cond_output, h
         return output + cond_output
-
-
-def test_discriminator():
-    """Test discriminator with CLIP embeddings"""
-    print("Testing Discriminator with CLIP embeddings...")
-
-    # Configuration
-    batch_size = 8
-    num_classes = 100
-    semantic_dim = 512  # CLIP dimension
-
-    # Create discriminator
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    discriminator = Discriminator(nc=3, ndf=64, semantic_dim=semantic_dim, semantic_proj_dim=256).to(device)
-
-    # Create dummy inputs
-    images = torch.randn(batch_size, 3, 32, 32, device=device)
-    labels = torch.randint(0, num_classes, (batch_size,), device=device)
-    semantic_embeddings = torch.randn(num_classes, semantic_dim, device=device)
-
-    # Forward pass
-    scores = discriminator(images, labels, semantic_embeddings)
-
-    print(f"✓ Input images shape: {images.shape}")
-    print(f"✓ Input labels shape: {labels.shape}")
-    print(f"✓ Semantic embeddings shape: {semantic_embeddings.shape}")
-    print(f"✓ Output scores shape: {scores.shape}")
-    print(f"✓ Output scores range: [{scores.min().item():.2f}, {scores.max().item():.2f}]")
-    print(f"✓ Discriminator parameters: {sum(p.numel() for p in discriminator.parameters()):,}")
-
-    # Check output is valid
-    assert scores.shape == (batch_size,), "Wrong output shape!"
-
-    print("\n✓ Discriminator test passed!")
-    return discriminator
-
-
-def test_gan_pair():
-    """Test Generator + Discriminator together"""
-    print("\n" + "=" * 70)
-    print("Testing Generator + Discriminator Pair")
-    print("=" * 70)
-
-    from src.models.generator import Generator
-
-    # Configuration
-    batch_size = 8
-    nz = 128
-    num_classes = 100
-    semantic_dim = 512
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # Create models
-    G = Generator(nz=nz, semantic_dim=semantic_dim).to(device)
-    D = Discriminator(semantic_dim=semantic_dim).to(device)
-
-    # Create inputs
-    z = torch.randn(batch_size, nz, device=device)
-    labels = torch.randint(0, num_classes, (batch_size,), device=device)
-    semantic_embeddings = torch.randn(num_classes, semantic_dim, device=device)
-
-    # Generate fake images
-    fake_images = G(z, labels, semantic_embeddings)
-
-    # Discriminate
-    fake_scores = D(fake_images, labels, semantic_embeddings)
-
-    print(f"✓ Generated images: {fake_images.shape}")
-    print(f"✓ Fake scores: {fake_scores.shape}")
-    print(f"✓ Mean fake score: {fake_scores.mean().item():.4f}")
-
-    # Test with real images
-    real_images = torch.randn(batch_size, 3, 32, 32, device=device)
-    real_scores = D(real_images, labels, semantic_embeddings)
-
-    print(f"✓ Real scores: {real_scores.shape}")
-    print(f"✓ Mean real score: {real_scores.mean().item():.4f}")
-
-    # Test backward pass
-    print("\nTesting backward pass...")
-    fake_loss = -fake_scores.mean()
-    fake_loss.backward()
-
-    print("✓ Backward pass successful!")
-
-    print("\n✓ GAN pair test passed!")
-    print("\nTotal parameters:")
-    print(f"  Generator: {sum(p.numel() for p in G.parameters()):,}")
-    print(f"  Discriminator: {sum(p.numel() for p in D.parameters()):,}")
-    print(f"  Total: {sum(p.numel() for p in G.parameters()) + sum(p.numel() for p in D.parameters()):,}")
-
-
-if __name__ == "__main__":
-    test_discriminator()
-    test_gan_pair()

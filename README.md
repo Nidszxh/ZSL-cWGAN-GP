@@ -2,13 +2,13 @@
 
 A PyTorch implementation of **Zero-Shot Learning (ZSL)** and **Generalized Zero-Shot Learning (GZSL)** using a **Conditional Wasserstein GAN with Gradient Penalty (cWGAN-GP)** on **CIFAR-100** with CLIP text embeddings.
 
-The model learns to generate realistic images for **unseen classes** by conditioning a WGAN-GP on **semantic embeddings** (CLIP text embeddings or GloVe). A classifier trained on these synthetic samples can then recognize categories it was never trained on, while GZSL extends this to also classify seen classes with calibrated stacking.
+The model learns to generate realistic images for **unseen classes** by conditioning a WGAN-GP on **CLIP text embeddings**. A classifier trained on these synthetic samples can then recognize categories it was never trained on, while GZSL extends this to also classify seen classes with calibrated stacking.
 
 ---
 
 ## Key Features
 
-- **Semantic Conditioning:** CLIP text embeddings (768-dim ViT-L/14), CLIP ensemble, or GloVe (300-dim)
+- **Semantic Conditioning:** CLIP text embeddings (768-dim ViT-L/14)
 - **Conditional WGAN-GP:** Stable training with gradient penalty, spectral normalization, TTUR (4× D LR)
 - **Self-Attention:** SAGAN-style attention at configurable resolutions (8×8, 16×16)
 - **Generalized ZSL:** Seen + unseen classification with calibrated temperature scaling
@@ -79,7 +79,7 @@ python -m test.test_training
 **Config** is controlled via `src/configs/config.yaml`:
 ```yaml
 embeddings:
-  type: "clip"                        # "clip" (768d), "clip_ensemble", "glove" (300d), or "both"
+  type: "clip"                        # CLIP-only (768-dim ViT-L/14)
 training:
   num_epochs: 150                     # Total training epochs
   batch_size: 128                     # 128 fits 8GB VRAM (501 img/s)
@@ -93,23 +93,18 @@ training:
 
 ### Quick Test
 ```bash
-python test_training.py     # 5-epoch CLIP test
+python -m test.test_training     # 5-epoch CLIP test
 ```
 
 ### CLIP Embedding Tests
 ```bash
-python test_clip.py         # validates CLIP integration
-```
-
-### Legacy GloVe Training
-```bash
-python ZSLcWGAN-GP.py       # original monolithic script
+python -m test.test_clip         # validates CLIP integration
 ```
 
 ### Interactive Demo
 After training, launch the Gradio demo:
 ```bash
-python app.py
+python -m src.app
 ```
 
 Upload an image from one of the 20 unseen CIFAR-100 classes and get top-5 ZSL predictions.
@@ -120,42 +115,43 @@ Upload an image from one of the 20 unseen CIFAR-100 classes and get top-5 ZSL pr
 
 ```
 ZSL-cWGAN-GP/
-├── main.py                  # Unified entrypoint (CLIP pipeline)
-├── app.py                   # Gradio demo
-├── ZSLcWGAN-GP.py           # Legacy monolithic script (GloVe)
-├── test_training.py         # Quick 5-epoch sanity check
-├── test_clip.py             # CLIP embedding tests
-├── AGENTS.md                # Detailed developer reference
-├── ARCHITECTURE.md          # Full component architecture
-├── CONTRIBUTING.md          # Contribution guidelines
-├── .pre-commit-config.yaml  # Code quality hooks (black, flake8, mypy)
-├── configs/
-│   └── config.yaml          # All hyperparameters
-├── models/
-│   ├── generator.py         # Conditional generator with self-attention
-│   ├── discriminator.py     # Projection discriminator
-│   └── zsl_classifier.py    # ZSL classifier (pluggable backbone)
-├── training/
-│   ├── trainer.py           # Training loop, EMA, checkpoint resume
-│   └── losses.py            # WGAN-GP loss + feature matching
-├── evaluation/
-│   ├── gan_eval.py          # FID / IS / KID evaluation
-│   ├── zsl_eval.py          # ZSL classifier training & eval
-│   └── gzsl_eval.py         # GZSL training, calibrated stacking, eval
-├── utils/
-│   ├── embeddings.py        # CLIP / CLIP ensemble / GloVe embedders
-│   ├── data_loader.py       # CIFAR-100 with seen/unseen split
-│   ├── metrics.py           # Metrics tracker
-│   └── visualization.py     # Plotting utilities
-├── data/                    # CIFAR-100 (auto-downloaded)
-├── cache/                   # Embedding cache, class split
-├── checkpoints/             # Saved model weights
-├── results/                 # Output images, plots, logs
-│   ├── fake/                # Generated samples for FID
-│   ├── real/                # Real samples for FID
-│   ├── unseen_synthetic/    # Unseen class generations
+├── src/
+│   ├── main.py               # Unified entrypoint (CLIP pipeline)
+│   ├── app.py                # Gradio demo
+│   ├── configs/
+│   │   └── config.yaml       # All hyperparameters
+│   ├── models/
+│   │   ├── generator.py      # Conditional generator with self-attention
+│   │   ├── discriminator.py  # Projection discriminator
+│   │   └── zsl_classifier.py # ZSL classifier (pluggable backbone)
+│   ├── training/
+│   │   ├── trainer.py        # Training loop, EMA, checkpoint resume
+│   │   └── losses.py         # WGAN-GP loss + feature matching
+│   ├── evaluation/
+│   │   ├── gan_eval.py       # FID / IS / KID evaluation
+│   │   ├── zsl_eval.py       # ZSL classifier training & eval
+│   │   └── gzsl_eval.py      # GZSL training, calibrated stacking, eval
+│   └── utils/
+│       ├── embeddings.py     # CLIP text embedder
+│       ├── data_loader.py    # CIFAR-100 with seen/unseen split
+│       ├── metrics.py        # Metrics tracker
+│       └── visualization.py  # Plotting utilities
+├── test/
+│   ├── test_training.py      # Quick 5-epoch sanity check
+│   └── test_clip.py          # CLIP embedding tests
+├── AGENTS.md                 # Developer reference
+├── ARCHITECTURE.md           # Full component architecture
+├── CONTRIBUTING.md           # Contribution guidelines
+├── .pre-commit-config.yaml   # Code quality hooks (black, flake8, mypy)
+├── data/                     # CIFAR-100 (auto-downloaded)
+├── cache/                    # Embedding cache, class split
+├── checkpoints/              # Saved model weights
+├── results/                  # Output images, plots, logs
+│   ├── fake/                 # Generated samples for FID
+│   ├── real/                 # Real samples for FID
+│   ├── unseen_synthetic/     # Unseen class generations
 │   └── ...
-└── runs/                    # TensorBoard logs
+└── runs/                     # TensorBoard logs
 ```
 
 ---
@@ -189,11 +185,11 @@ GZSL Harmonic Mean (H): 12.34%
 
 ## Configuration Reference
 
-Key settings in `configs/config.yaml`:
+Key settings in `src/configs/config.yaml`:
 
 | Key | Default | Description |
 |---|---|---|
-| `embeddings.type` | `"clip"` | `"clip"`, `"clip_ensemble"`, `"glove"`, or `"both"` |
+| `embeddings.type` | `"clip"` | `"clip"` (only supported option) |
 | `embeddings.clip_model` | `"openai/clip-vit-large-patch14"` | HuggingFace CLIP model name |
 | `training.num_epochs` | `150` | Total training epochs |
 | `training.batch_size` | `128` | Batch size (benchmarked up to 160 on 8GB) |
@@ -204,9 +200,9 @@ Key settings in `configs/config.yaml`:
 | `training.eval_interval` | `10` | FID eval frequency (epochs) |
 | `training.early_stopping_patience` | `20` | Patience before early stop |
 | `training.mixed_precision` | `true` | Enable torch.amp autocast + GradScaler |
-| `evaluation.fid_samples` | `20000` | Samples for FID calculation |
+| `evaluation.fid_samples` | `4000` | Samples for FID calculation (matches the 4,000-image seen val subset; equal real/fake counts) |
 | `evaluation.synthetic_samples_per_class` | `2000` | Synthetic images per unseen class |
-| `evaluation.gzsl.enabled` | `false` | Enable GZSL training/evaluation |
+| `evaluation.gzsl.enabled` | `true` | Enable GZSL training/evaluation |
 
 ---
 
@@ -214,7 +210,6 @@ Key settings in `configs/config.yaml`:
 
 - **CIFAR-100** — via `torchvision.datasets`
 - **CLIP model** — `openai/clip-vit-large-patch14` via HuggingFace `transformers`
-- **GloVe 6B 300d** — ~822MB zip from Stanford (only when using GloVe)
 
 ---
 
@@ -226,6 +221,5 @@ MIT
 
 - [PyTorch](https://pytorch.org/)
 - [OpenAI CLIP](https://github.com/openai/CLIP)
-- [Stanford GloVe](https://nlp.stanford.edu/projects/glove/)
 - [CIFAR-100](https://www.cs.toronto.edu/~kriz/cifar.html)
 - [Torch-Fidelity](https://github.com/toshas/torch-fidelity)

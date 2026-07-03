@@ -12,7 +12,6 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import ConcatDataset, DataLoader, Dataset, TensorDataset, random_split
 from torchvision import transforms
@@ -118,7 +117,6 @@ def _generate_synthetic_data(
 
 def train_gzsl_classifier(
     generator: torch.nn.Module,
-    seen_semantic_embeddings: torch.Tensor,
     unseen_semantic_embeddings: torch.Tensor,
     seen_classes: np.ndarray,
     unseen_classes: np.ndarray,
@@ -154,9 +152,9 @@ def train_gzsl_classifier(
     regenerate_every = config["evaluation"].get("zsl_regenerate_every", 1)
     calibration_mode = gzsl_cfg.get("calibration", "learned_temperature")
 
-    from src.models.zsl_classifier import ZSLClassifier
+    from src.models.zsl_classifier import build_classifier_from_config
 
-    base_classifier = ZSLClassifier(num_total).to(device)
+    base_classifier = build_classifier_from_config(num_total, config).to(device)
     classifier = CalibratedClassifier(base_classifier, num_seen, num_unseen, calibration=calibration_mode).to(device)
 
     criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
@@ -171,13 +169,18 @@ def train_gzsl_classifier(
     patience = 10
     epochs_without_improv = 0
 
-    plain_transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-    ])
+    plain_transform = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        ]
+    )
     plain_seen = FilteredCIFAR100(
-        root=config["paths"]["data_root"], train=True, download=True,
-        transform=plain_transform, allowed_classes=seen_classes,
+        root=config["paths"]["data_root"],
+        train=True,
+        download=True,
+        transform=plain_transform,
+        allowed_classes=seen_classes,
     )
     split_gen = torch.Generator().manual_seed(config["experiment"]["seed"])
     plain_size = int(0.9 * len(plain_seen))
@@ -196,19 +199,34 @@ def train_gzsl_classifier(
                 batch_size=zsl_batch_size,
                 device=device,
             )
-            num_workers = min(config.get("dataset", {}).get("num_workers", 0), 2)
+            num_workers = min(config.get("dataset", {}).get("num_workers", 4), 4)
             split_gen = torch.Generator().manual_seed(42)
-            synth_train, synth_val = random_split(synth_dataset, [synth_train_size, synth_val_size], generator=split_gen)
-            synth_train_loader = DataLoader(synth_train, batch_size=zsl_batch_size, shuffle=True, num_workers=num_workers)
-
-            shifted_synth = _LabelShiftedDataset(synth_train, num_seen)
-            combined_dataset = ConcatDataset([seen_dataset, shifted_synth])
-            combined_train_loader = DataLoader(
-                combined_dataset, batch_size=zsl_batch_size, shuffle=True,
-                num_workers=num_workers, drop_last=True,
+            synth_train, synth_val = random_split(
+                synth_dataset, [synth_train_size, synth_val_size], generator=split_gen
             )
 
-            synth_val_loader = DataLoader(synth_val, batch_size=100, shuffle=False, num_workers=num_workers)
+            shifted_synth_train = _LabelShiftedDataset(synth_train, num_seen)
+            combined_dataset = ConcatDataset([seen_dataset, shifted_synth_train])
+            combined_train_loader = DataLoader(
+                combined_dataset,
+                batch_size=zsl_batch_size,
+                shuffle=True,
+                num_workers=num_workers,
+                pin_memory=True,
+                persistent_workers=num_workers > 0,
+                prefetch_factor=2 if num_workers > 0 else None,
+                drop_last=True,
+            )
+
+            shifted_synth_val = _LabelShiftedDataset(synth_val, num_seen)
+            # L1-F14: val labels need the same num_seen shift as train.
+            synth_val_loader = DataLoader(
+                shifted_synth_val,
+                batch_size=100,
+                shuffle=False,
+                num_workers=num_workers,
+                pin_memory=True,
+            )
 
         classifier.train()
         train_loss = 0
@@ -217,7 +235,8 @@ def train_gzsl_classifier(
 
         pbar = tqdm(combined_train_loader, desc=f"GZSL Epoch {epoch + 1}/{zsl_epochs}")
         for images, labels in pbar:
-            images, labels = images.to(device), labels.to(device)
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
             images = zsl_augment(images)
 
             optimizer.zero_grad(set_to_none=True)
@@ -239,17 +258,20 @@ def train_gzsl_classifier(
                 _, predicted = outputs.max(1)
                 total += labels.size(0)
                 correct += predicted.eq(labels).sum().item()
-            pbar.set_postfix({
-                "Loss": f"{train_loss / max(1, pbar.n + 1):.4f}",
-                "Acc": f"{100.0 * correct / max(1, total):.2f}%",
-            })
+            pbar.set_postfix(
+                {
+                    "Loss": f"{train_loss / max(1, pbar.n + 1):.4f}",
+                    "Acc": f"{100.0 * correct / max(1, total):.2f}%",
+                }
+            )
 
         classifier.eval()
         val_correct = 0
         val_total = 0
         with torch.no_grad():
             for images, labels in synth_val_loader:
-                images, labels = images.to(device), labels.to(device)
+                images = images.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
                 outputs = classifier(images)
                 _, predicted = outputs.max(1)
                 val_total += labels.size(0)
@@ -282,7 +304,6 @@ def evaluate_gzsl(
     seen_eval_loader: DataLoader,
     class_names: list,
     device: torch.device,
-    results_dir: str = "results",
 ) -> dict:
     """
     Evaluate GZSL: classifier must predict correctly for both seen and unseen classes.
@@ -309,7 +330,8 @@ def evaluate_gzsl(
 
     with torch.no_grad():
         for images, labels in tqdm(seen_eval_loader, desc="Evaluating seen classes"):
-            images, labels = images.to(device), labels.to(device)
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
             outputs = classifier(images)
             _, predicted = outputs.max(1)
             batch_size = labels.size(0)
@@ -318,15 +340,17 @@ def evaluate_gzsl(
             correct_mask = predicted.eq(labels)
             seen_correct += correct_mask.sum().item()
             all_correct += correct_mask.sum().item()
-            for i in range(batch_size):
-                lbl = labels[i].item()
-                per_class_correct[lbl] += (predicted[i] == lbl).item()
-                per_class_total[lbl] += 1
-                confusion_matrix[lbl][predicted[i]] += 1
+            cnt = torch.bincount(labels, minlength=num_total)
+            corr = torch.bincount(labels[correct_mask], minlength=num_total)
+            per_class_total = [t + c.item() for t, c in zip(per_class_total, cnt)]
+            per_class_correct = [t + c.item() for t, c in zip(per_class_correct, corr)]
+            flat = (labels * num_total + predicted).flatten()
+            confusion_matrix += torch.bincount(flat, minlength=num_total * num_total).view(num_total, num_total).cpu()
 
     with torch.no_grad():
         for images, labels in tqdm(test_loader, desc="Evaluating unseen classes"):
-            images, labels = images.to(device), labels.to(device)
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
             labels = labels + num_seen
             outputs = classifier(images)
             _, predicted = outputs.max(1)
@@ -336,23 +360,23 @@ def evaluate_gzsl(
             correct_mask = predicted.eq(labels)
             unseen_correct += correct_mask.sum().item()
             all_correct += correct_mask.sum().item()
-            for i in range(batch_size):
-                true_lbl = labels[i].item()
-                pred_lbl = predicted[i].item()
-                per_class_correct[true_lbl] += (pred_lbl == true_lbl).item()
-                per_class_total[true_lbl] += 1
-                confusion_matrix[true_lbl][pred_lbl] += 1
+            cnt = torch.bincount(labels, minlength=num_total)
+            corr = torch.bincount(labels[correct_mask], minlength=num_total)
+            per_class_total = [t + c.item() for t, c in zip(per_class_total, cnt)]
+            per_class_correct = [t + c.item() for t, c in zip(per_class_correct, corr)]
+            flat = (labels * num_total + predicted).flatten()
+            confusion_matrix += torch.bincount(flat, minlength=num_total * num_total).view(num_total, num_total).cpu()
 
     seen_acc = 100.0 * seen_correct / seen_total if seen_total > 0 else 0
     unseen_acc = 100.0 * unseen_correct / unseen_total if unseen_total > 0 else 0
+    # L1-F9: H is sample-level accuracy (balanced CIFAR-100, so ~per-class-mean).
     harmonic_mean = 2 * seen_acc * unseen_acc / (seen_acc + unseen_acc) if (seen_acc + unseen_acc) > 0 else 0
     overall_acc = 100.0 * all_correct / all_total if all_total > 0 else 0
 
     per_class_acc = [
-        100.0 * per_class_correct[i] / per_class_total[i] if per_class_total[i] > 0 else 0
-        for i in range(num_total)
+        100.0 * per_class_correct[i] / per_class_total[i] if per_class_total[i] > 0 else 0 for i in range(num_total)
     ]
-    mean_class_acc = float(np.mean([a for a in per_class_acc if a > 0]))
+    mean_class_acc = float(np.mean(per_class_acc))
 
     for i in range(num_total):
         if per_class_total[i] > 0:
@@ -410,8 +434,12 @@ def plot_gzsl_results(gzsl_metrics: dict, save_dir: str = "results"):
     ax1.grid(True, alpha=0.3, axis="y")
     for bar, val in zip(bars, values):
         ax1.text(
-            bar.get_x() + bar.get_width() / 2, bar.get_height() + 1,
-            f"{val:.1f}%", ha="center", fontsize=11, fontweight="bold",
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height() + 1,
+            f"{val:.1f}%",
+            ha="center",
+            fontsize=11,
+            fontweight="bold",
         )
 
     ax2 = axes[1]

@@ -7,10 +7,8 @@ Improvements:
 - Exponential Moving Average (EMA) of Generator weights
 - Gradient penalty scheduling (lambda_gp increases over time)
 - Feature matching loss
-- Gradient accumulation support
 """
 
-import copy
 from pathlib import Path
 
 import torch
@@ -44,9 +42,7 @@ class EMAModel:
 
     def apply_shadow(self) -> None:
         self.backup = {k: v.clone().detach() for k, v in self.model.state_dict().items()}
-        self.model.load_state_dict(
-            {k: v.to(self.model.parameters().__next__().device) for k, v in self.shadow.items()}
-        )
+        self.model.load_state_dict({k: v.to(self.model.parameters().__next__().device) for k, v in self.shadow.items()})
 
     def restore(self) -> None:
         self.model.load_state_dict(self.backup)
@@ -66,6 +62,7 @@ def _get_scheduler(optimizer, cfg, num_epochs, warmup_epochs):
         return SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[warmup_epochs])
     else:
         from torch.optim.lr_scheduler import ExponentialLR
+
         return ExponentialLR(optimizer, gamma=cfg.get("lr_decay", 0.995))
 
 
@@ -83,6 +80,20 @@ def train_gan(
     paths = config["paths"]
     eval_cfg = config["evaluation"]
     model_cfg = config["model"]
+
+    # L2-F3: TF32 + cudnn.benchmark — determinism OFF (~20% speed on RTX 4060).
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False
+
+    # Optional torch.compile (config `training.compile`, OFF by default); needs a
+    # GPU smoke test with the GP's create_graph=True backprop first.
+    compile_mode = cfg.get("compile")
+    if compile_mode and device.type == "cuda":
+        netG = torch.compile(netG, mode=compile_mode)
+        netD = torch.compile(netD, mode=compile_mode)
+        print(f"torch.compile enabled on G/D (mode={compile_mode})")
 
     nz = model_cfg["generator"]["nz"]
     num_seen_classes = seen_embeddings.size(0)
@@ -123,7 +134,7 @@ def train_gan(
             print(f"Warning: resume path {resume_path} not found, starting from scratch")
         else:
             print(f"\nResuming from checkpoint: {resume_path}")
-            ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+            ckpt = torch.load(resume_path, map_location=device, weights_only=True)
             netG.load_state_dict(ckpt["generator"])
             netD.load_state_dict(ckpt["discriminator"])
             optimizerG.load_state_dict(ckpt["optimizerG"])
@@ -132,7 +143,7 @@ def train_gan(
             schedulerD.load_state_dict(ckpt["schedulerD"])
             start_epoch = ckpt["epoch"]
             global_step = ckpt.get("global_step", 0)
-            tracker.epochs_without_improv = ckpt.get("epochs_without_improv", 0)
+            tracker.last_improved_epoch = ckpt.get("last_improved_epoch", start_epoch)
 
             if use_ema and "ema_shadow" in ckpt and start_epoch >= ema_start_epoch:
                 ema.shadow = {k: v.to(device) if torch.is_tensor(v) else v for k, v in ckpt["ema_shadow"].items()}
@@ -155,10 +166,14 @@ def train_gan(
         netD.train()
 
         current_lambda_gp = lambda_gp_base
-        if lambda_gp_schedule and epoch < lambda_gp_ramp_epochs:
-            progress = epoch / lambda_gp_ramp_epochs
-            current_lambda_gp = lambda_gp_base + (lambda_gp_final - lambda_gp_base) * progress
-            loss_fn.lambda_gp = current_lambda_gp
+        if lambda_gp_schedule:
+            if epoch < lambda_gp_ramp_epochs:
+                progress = epoch / lambda_gp_ramp_epochs
+                current_lambda_gp = lambda_gp_base + (lambda_gp_final - lambda_gp_base) * progress
+            else:
+                current_lambda_gp = lambda_gp_final
+        # L1-F6: always assign lambda_gp (resume doesn't restore it).
+        loss_fn.lambda_gp = current_lambda_gp
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{cfg['num_epochs']}")
         epoch_g_loss = 0.0
@@ -166,7 +181,8 @@ def train_gan(
         epoch_batches = 0
 
         for real_images, labels in pbar:
-            real_images, labels = real_images.to(device), labels.to(device)
+            real_images = real_images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
             batch_size = real_images.size(0)
             epoch_batches += 1
             global_step += 1
@@ -222,12 +238,24 @@ def train_gan(
             if global_step % 50 == 0:
                 writer.add_scalar("Loss/Generator", g_loss_dict["g_loss"].item(), global_step)
                 writer.add_scalar("Loss/Discriminator", d_loss_dict["d_loss"].item(), global_step)
-                writer.add_scalar("Loss/Wasserstein_Distance", d_loss_dict["wasserstein_distance"], global_step)
-                writer.add_scalar("Loss/Gradient_Penalty", d_loss_dict["gradient_penalty"], global_step)
+                writer.add_scalar(
+                    "Loss/Wasserstein_Distance",
+                    d_loss_dict["wasserstein_distance"],
+                    global_step,
+                )
+                writer.add_scalar(
+                    "Loss/Gradient_Penalty",
+                    d_loss_dict["gradient_penalty"],
+                    global_step,
+                )
                 writer.add_scalar("LR/Discriminator", optimizerD.param_groups[0]["lr"], global_step)
                 writer.add_scalar("LR/Generator", optimizerG.param_groups[0]["lr"], global_step)
                 if "feature_matching_loss" in g_loss_dict:
-                    writer.add_scalar("Loss/Feature_Matching", g_loss_dict["feature_matching_loss"], global_step)
+                    writer.add_scalar(
+                        "Loss/Feature_Matching",
+                        g_loss_dict["feature_matching_loss"],
+                        global_step,
+                    )
                 if lambda_gp_schedule:
                     writer.add_scalar("Config/Lambda_GP", current_lambda_gp, global_step)
 
@@ -246,7 +274,15 @@ def train_gan(
         if use_ema and epoch >= ema_start_epoch:
             ema.apply_shadow()
 
-        grid = save_sample_grid(netG, fixed_noise, fixed_labels, seen_embeddings, epoch + 1, device, save_dir=paths["results_dir"])
+        grid = save_sample_grid(
+            netG,
+            fixed_noise,
+            fixed_labels,
+            seen_embeddings,
+            epoch + 1,
+            device,
+            save_dir=paths["results_dir"],
+        )
         writer.add_image("Generated_Samples", grid, epoch + 1)
 
         if (epoch + 1) % cfg["eval_interval"] == 0 or epoch == cfg["num_epochs"] - 1:
@@ -265,8 +301,11 @@ def train_gan(
                 seen_embeddings=seen_embeddings,
             )
             metrics = compute_fid(real_images_dir, fake_dir)
+            # L2-F1: free torch-fidelity's Inception caches (8GB VRAM).
+            torch.cuda.empty_cache()
             print(
-                f"FID: {metrics['fid']:.2f} | IS: {metrics['is_mean']:.2f} +- {metrics['is_std']:.2f} | KID: {metrics['kid_mean']:.4f}"
+                f"FID: {metrics['fid']:.2f} | IS: {metrics['is_mean']:.2f} "
+                f"+- {metrics['is_std']:.2f} | KID: {metrics['kid_mean']:.4f}"
             )
 
             improved = tracker.update_metrics(
@@ -284,7 +323,7 @@ def train_gan(
             if use_ema and epoch >= ema_start_epoch:
                 ema.restore()
 
-            if tracker.should_stop_early(cfg["early_stopping_patience"]):
+            if tracker.should_stop_early(cfg["early_stopping_patience"], epoch + 1):
                 print(f"\nEarly stopping after {epoch + 1} epochs without improvement\n")
                 break
         else:
@@ -303,7 +342,7 @@ def train_gan(
                 "schedulerG": schedulerG.state_dict(),
                 "schedulerD": schedulerD.state_dict(),
                 "global_step": global_step,
-                "epochs_without_improv": tracker.epochs_without_improv,
+                "last_improved_epoch": tracker.last_improved_epoch,
                 "config": config,
             }
             if use_ema and epoch >= ema_start_epoch:

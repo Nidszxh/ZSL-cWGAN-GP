@@ -1,5 +1,8 @@
 """Data Loader Module: CIFAR-100 with seen/unseen split."""
 
+import os
+import pickle
+
 import torch
 import numpy as np
 import json
@@ -48,26 +51,50 @@ def get_class_split(
         print(f"Loading class split from {split_file}")
         with open(split_file, "r") as f:
             split_data = json.load(f)
-            seen_classes = np.array(split_data["seen"])
-            unseen_classes = np.array(split_data["unseen"])
+            seen_classes = np.sort(np.array(split_data["seen"]))
+            unseen_classes = np.sort(np.array(split_data["unseen"]))
     else:
         print(f"Creating new class split (seed={seed})")
         rng = np.random.RandomState(seed)
         all_classes = np.arange(num_classes)
         rng.shuffle(all_classes)
 
-        seen_classes = all_classes[:seen_count]
-        unseen_classes = all_classes[seen_count:]
+        seen_classes = np.sort(all_classes[:seen_count])
+        unseen_classes = np.sort(all_classes[seen_count:])
 
         # Save split
         with open(split_file, "w") as f:
-            json.dump({"seen": seen_classes.tolist(), "unseen": unseen_classes.tolist(), "seed": seed}, f, indent=2)
+            json.dump(
+                {
+                    "seen": seen_classes.tolist(),
+                    "unseen": unseen_classes.tolist(),
+                    "seed": seed,
+                },
+                f,
+                indent=2,
+            )
 
         print(f"Saved class split to {split_file}")
 
+    # L1-F13: arrays must stay sorted (FilteredCIFAR100 uses sorted-rank labels);
+    # np.sort() on both paths repairs shuffled caches.
     print(f"Seen classes: {len(seen_classes)}, Unseen classes: {len(unseen_classes)}")
 
     return seen_classes, unseen_classes
+
+
+def get_class_names(data_root: str) -> list:
+    """Load the 100 CIFAR-100 fine class names without loading the image data.
+
+    Reads the torchvision meta pickle directly; downloads CIFAR-100 if the meta
+    file is missing.
+    """
+    meta_path = Path(data_root) / "cifar-100-python" / "meta"
+    if not meta_path.exists():
+        datasets.CIFAR100(root=data_root, download=True)
+    with open(meta_path, "rb") as f:
+        meta = pickle.load(f, encoding="latin1")
+    return meta["fine_label_names"]
 
 
 def get_data_loaders(
@@ -96,25 +123,62 @@ def get_data_loaders(
     transform_val = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
 
     # Create separate datasets with different transforms
-    train_dataset = FilteredCIFAR100(root=config["paths"]["data_root"], train=True, download=True, transform=transform_train, allowed_classes=seen_classes)
-    val_dataset = FilteredCIFAR100(root=config["paths"]["data_root"], train=True, download=True, transform=transform_val, allowed_classes=seen_classes)
+    train_dataset = FilteredCIFAR100(
+        root=config["paths"]["data_root"],
+        train=True,
+        download=True,
+        transform=transform_train,
+        allowed_classes=seen_classes,
+    )
+    val_dataset = FilteredCIFAR100(
+        root=config["paths"]["data_root"],
+        train=True,
+        download=True,
+        transform=transform_val,
+        allowed_classes=seen_classes,
+    )
 
-    # Aligned split using same generator seed — yields matching indices
+    # L1-F19: aligned split — a fresh generator with the SAME seed replays the same
+    # permutation; a shared generator across two random_split calls overlaps val ~90% with train.
     split_gen = torch.Generator().manual_seed(config["experiment"]["seed"])
     train_size = int(0.9 * len(train_dataset))
     val_size = len(train_dataset) - train_size
     train_subset, _ = random_split(train_dataset, [train_size, val_size], generator=split_gen)
-    _, val_subset = random_split(val_dataset, [train_size, val_size], generator=split_gen)
+    _, val_subset = random_split(
+        val_dataset,
+        [train_size, val_size],
+        generator=torch.Generator().manual_seed(config["experiment"]["seed"]),
+    )
 
     # Create loaders
-    num_workers = min(config["dataset"]["num_workers"], 4)
+    num_workers = min(config["dataset"].get("num_workers", 4), os.cpu_count() or 4)
+    loader_kwargs = dict(
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=num_workers > 0,
+        prefetch_factor=2 if num_workers > 0 else None,
+    )
 
-    train_loader = DataLoader(train_subset, batch_size=config["training"]["batch_size"], shuffle=True, num_workers=num_workers, pin_memory=True, persistent_workers=True if num_workers > 0 else False)
+    train_loader = DataLoader(
+        train_subset,
+        batch_size=config["training"]["batch_size"],
+        shuffle=True,
+        **loader_kwargs,
+    )
 
-    val_loader = DataLoader(val_subset, batch_size=config["training"]["batch_size"], shuffle=False, num_workers=num_workers, pin_memory=True, persistent_workers=True if num_workers > 0 else False)
+    val_loader = DataLoader(
+        val_subset,
+        batch_size=config["training"]["batch_size"],
+        shuffle=False,
+        **loader_kwargs,
+    )
 
     # Class info
-    class_info = {"org_to_new": train_dataset.org_to_new, "new_to_org": {v: k for k, v in train_dataset.org_to_new.items()}, "num_seen_classes": len(train_dataset.org_to_new)}
+    class_info = {
+        "org_to_new": train_dataset.org_to_new,
+        "new_to_org": {v: k for k, v in train_dataset.org_to_new.items()},
+        "num_seen_classes": len(train_dataset.org_to_new),
+    }
 
     print(f"Train samples: {len(train_subset)}")
     print(f"Val samples: {len(val_subset)}")
@@ -136,42 +200,30 @@ def get_test_loader(
     """
     transform_test = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
 
-    test_dataset = FilteredCIFAR100(root=config["paths"]["data_root"], train=False, download=True, transform=transform_test, allowed_classes=unseen_classes)
+    test_dataset = FilteredCIFAR100(
+        root=config["paths"]["data_root"],
+        train=False,
+        download=True,
+        transform=transform_test,
+        allowed_classes=unseen_classes,
+    )
 
-    test_loader = DataLoader(test_dataset, batch_size=100, shuffle=False, num_workers=min(config["dataset"]["num_workers"], 4), pin_memory=True)
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=100,
+        shuffle=False,
+        num_workers=min(config["dataset"].get("num_workers", 4), os.cpu_count() or 4),
+        pin_memory=True,
+        persistent_workers=False,
+    )
 
-    class_info = {"org_to_new": test_dataset.org_to_new, "new_to_org": {v: k for k, v in test_dataset.org_to_new.items()}, "num_unseen_classes": len(test_dataset.org_to_new)}
+    class_info = {
+        "org_to_new": test_dataset.org_to_new,
+        "new_to_org": {v: k for k, v in test_dataset.org_to_new.items()},
+        "num_unseen_classes": len(test_dataset.org_to_new),
+    }
 
     print(f"Test samples: {len(test_dataset)}")
     print(f"Unseen classes: {class_info['num_unseen_classes']}")
 
     return test_loader, class_info
-
-
-if __name__ == "__main__":
-    # Test data loading
-    import yaml
-
-    print("Testing data loader...")
-
-    # Load config
-    with open("configs/config.yaml", "r") as f:
-        config = yaml.safe_load(f)
-
-    # Get class split
-    seen_classes, unseen_classes = get_class_split(
-        num_classes=config["dataset"]["num_classes"], seen_count=config["dataset"]["seen_classes"], cache_dir=config["paths"]["cache_dir"], seed=config["experiment"]["seed"]
-    )
-
-    # Get data loaders
-    train_loader, val_loader, class_info = get_data_loaders(config, seen_classes)
-
-    # Test batch
-    print("\nTesting batch loading...")
-    images, labels = next(iter(train_loader))
-    print(f"✓ Batch images shape: {images.shape}")
-    print(f"✓ Batch labels shape: {labels.shape}")
-    print(f"✓ Image range: [{images.min():.2f}, {images.max():.2f}]")
-    print(f"✓ Unique labels in batch: {labels.unique().tolist()}")
-
-    print("\n✓ Data loader test passed!")

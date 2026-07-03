@@ -17,7 +17,7 @@ class MetricsTracker:
         self.metrics_history: list[tuple[int, dict]] = []
 
         self.best_fid = float("inf")
-        self.epochs_without_improv = 0
+        self.last_improved_epoch = 0
         self.writer = writer
 
     def update(self, g_loss: float, d_loss: float, w_dist: float, gp: float) -> None:
@@ -44,7 +44,7 @@ class MetricsTracker:
 
         if fid_score < self.best_fid:
             self.best_fid = fid_score
-            self.epochs_without_improv = 0
+            self.last_improved_epoch = epoch
 
             ckpt_dir = Path(checkpoints_dir)
             ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -59,8 +59,8 @@ class MetricsTracker:
             )
             return True
         else:
-            self.epochs_without_improv += 1
             return False
 
-    def should_stop_early(self, patience: int) -> bool:
-        return self.epochs_without_improv >= patience
+    def should_stop_early(self, patience: int, current_epoch: int) -> bool:
+        # L1-F20: early stopping counts epochs-since-improvement, not evaluation calls.
+        return current_epoch - self.last_improved_epoch >= patience

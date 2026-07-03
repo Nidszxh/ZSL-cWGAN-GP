@@ -17,16 +17,20 @@ def compute_gradient_penalty(
 ) -> torch.Tensor:
     batch_size = real_images.size(0)
     alpha = torch.rand(batch_size, 1, 1, 1, device=device)
+    # L1-F1: GP must not backprop into the generator.
+    fake_images = fake_images.detach()
     interpolates = (alpha * real_images + (1 - alpha) * fake_images).requires_grad_(True)
-    d_interpolates = discriminator(interpolates, labels, semantic_embeddings)
-    gradients = torch.autograd.grad(
-        outputs=d_interpolates,
-        inputs=interpolates,
-        grad_outputs=torch.ones_like(d_interpolates),
-        create_graph=True,
-        retain_graph=True,
-        only_inputs=True,
-    )[0]
+    # L1-F10: GP in explicit fp32 (autocast would zero it under AMP).
+    with torch.autocast(device_type="cuda", enabled=False):
+        d_interpolates = discriminator(interpolates, labels, semantic_embeddings)
+        gradients = torch.autograd.grad(
+            outputs=d_interpolates,
+            inputs=interpolates,
+            grad_outputs=torch.ones_like(d_interpolates),
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True,
+        )[0]
     gradients = gradients.view(batch_size, -1)
     gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
     return gradient_penalty * lambda_gp
@@ -78,13 +82,13 @@ class WGANGPLoss:
         real_images: torch.Tensor = None,
         feature_matching_weight: float = 0.0,
     ) -> dict:
-        fake_output = discriminator(fake_images, labels, semantic_embeddings)
+        # L1-F2: one forward supplies both score and features for feature matching.
+        fake_output, fake_features = discriminator(fake_images, labels, semantic_embeddings, return_features=True)
         g_loss = wasserstein_loss_generator(fake_output)
         result = {"g_loss": g_loss}
 
         if feature_matching_weight > 0 and real_images is not None:
             _, real_features = discriminator(real_images, labels, semantic_embeddings, return_features=True)
-            _, fake_features = discriminator(fake_images, labels, semantic_embeddings, return_features=True)
             fm_loss = nn.functional.mse_loss(fake_features, real_features)
             weighted_fm = feature_matching_weight * fm_loss
             result["feature_matching_loss"] = weighted_fm.item()

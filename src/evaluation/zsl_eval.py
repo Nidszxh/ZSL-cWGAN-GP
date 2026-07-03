@@ -5,17 +5,16 @@ Uses a pretrained-backbone classifier trained on synthetic unseen-class images.
 """
 
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset, TensorDataset, random_split
+from torch.utils.data import DataLoader, TensorDataset, random_split
 from torchvision import transforms
 from tqdm import tqdm
 
-from src.models.zsl_classifier import ZSLClassifier, build_classifier_from_config
+from src.models.zsl_classifier import build_classifier_from_config
 
 zsl_augment = transforms.Compose(
     [
@@ -117,8 +116,19 @@ def train_zsl_classifier(
             )
             split_gen = torch.Generator().manual_seed(42)
             synth_train, synth_val = random_split(full_dataset, [train_size, val_size], generator=split_gen)
-            synth_train_loader = DataLoader(synth_train, batch_size=zsl_batch_size, shuffle=True)
-            synth_val_loader = DataLoader(synth_val, batch_size=100, shuffle=False)
+            num_workers = min(config["dataset"].get("num_workers", 4), 4)
+            synth_train_loader = DataLoader(
+                synth_train,
+                batch_size=zsl_batch_size,
+                shuffle=True,
+                num_workers=num_workers,
+                pin_memory=True,
+                persistent_workers=num_workers > 0,
+                prefetch_factor=2 if num_workers > 0 else None,
+            )
+            synth_val_loader = DataLoader(
+                synth_val, batch_size=100, shuffle=False, num_workers=num_workers, pin_memory=True
+            )
 
         classifier.train()
         train_loss = 0
@@ -127,7 +137,8 @@ def train_zsl_classifier(
 
         pbar = tqdm(synth_train_loader, desc=f"ZSL Epoch {epoch + 1}/{zsl_epochs}")
         for images, labels in pbar:
-            images, labels = images.to(device), labels.to(device)
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
             images = zsl_augment(images)
 
             optimizer.zero_grad(set_to_none=True)
@@ -161,7 +172,8 @@ def train_zsl_classifier(
         val_total = 0
         with torch.no_grad():
             for images, labels in synth_val_loader:
-                images, labels = images.to(device), labels.to(device)
+                images = images.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
                 outputs = classifier(images)
                 _, predicted = outputs.max(1)
                 val_total += labels.size(0)
@@ -182,9 +194,7 @@ def train_zsl_classifier(
                 print(f"Early stopping after {epoch + 1} epochs")
                 break
 
-    classifier.load_state_dict(
-        torch.load(Path(checkpoints_dir) / "best_zsl_classifier.pth", weights_only=True)
-    )
+    classifier.load_state_dict(torch.load(Path(checkpoints_dir) / "best_zsl_classifier.pth", weights_only=True))
     return classifier
 
 
@@ -194,7 +204,6 @@ def evaluate_zsl(
     unseen_classes: np.ndarray,
     class_names: list,
     device: torch.device,
-    results_dir: str = "results",
 ) -> dict:
     num_unseen = len(unseen_classes)
     classifier.eval()
@@ -209,28 +218,31 @@ def evaluate_zsl(
     print("\nEvaluating on real unseen class data...")
     with torch.no_grad():
         for images, labels in tqdm(test_loader, desc="Testing"):
-            images, labels = images.to(device), labels.to(device)
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
             outputs = classifier(images)
 
             _, predicted = outputs.max(1)
+            correct_mask = predicted.eq(labels)
             total += labels.size(0)
-            correct += predicted.eq(labels).sum().item()
+            correct += correct_mask.sum().item()
 
             _, top5_pred = outputs.topk(5, 1, True, True)
             top5_correct += top5_pred.eq(labels.view(-1, 1).expand_as(top5_pred)).sum().item()
 
-            for i in range(len(labels)):
-                label = labels[i].item()
-                class_correct[label] += (predicted[i] == label).item()
-                class_total[label] += 1
-                confusion_matrix[label][predicted[i]] += 1
+            # L1-F8: vectorized per-class counts via bincount.
+            cnt = torch.bincount(labels, minlength=num_unseen)
+            corr = torch.bincount(labels[correct_mask], minlength=num_unseen)
+            class_total = [t + c.item() for t, c in zip(class_total, cnt)]
+            class_correct = [t + c.item() for t, c in zip(class_correct, corr)]
+
+            flat = (labels * num_unseen + predicted).flatten()
+            counts = torch.bincount(flat, minlength=num_unseen * num_unseen)
+            confusion_matrix += counts.view(num_unseen, num_unseen).cpu()
 
     top1_accuracy = 100.0 * correct / total
     top5_accuracy = 100.0 * top5_correct / total
-    per_class_acc = [
-        100.0 * class_correct[i] / class_total[i] if class_total[i] > 0 else 0
-        for i in range(num_unseen)
-    ]
+    per_class_acc = [100.0 * class_correct[i] / class_total[i] if class_total[i] > 0 else 0 for i in range(num_unseen)]
     mean_class_acc = float(np.mean(per_class_acc))
 
     for i in range(num_unseen):

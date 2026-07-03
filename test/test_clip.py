@@ -9,7 +9,7 @@ import sys
 # Add project root to path
 sys.path.append(str(Path(__file__).parent.parent))
 
-from src.utils.embeddings import CLIPTextEmbedder, GloVeEmbedder, EmbeddingManager
+from src.utils.embeddings import CLIPTextEmbedder, EmbeddingManager
 
 
 def test_clip_basic():
@@ -63,38 +63,6 @@ def test_cifar100_embeddings():
     return embeddings_dict
 
 
-def test_glove_comparison():
-    """Compare CLIP vs GloVe"""
-    print("\n" + "=" * 70)
-    print("TEST 3: CLIP vs GloVe Comparison")
-    print("=" * 70)
-
-    cifar100 = datasets.CIFAR100(root="./data", download=True, train=False)
-    class_names = cifar100.classes
-
-    # Test on subset
-    test_classes = class_names[:10]
-
-    # CLIP
-    clip_embedder = CLIPTextEmbedder()
-    clip_emb = clip_embedder.get_class_embeddings(test_classes)
-
-    print(f"✓ CLIP embeddings: {len(clip_emb)} classes, dim={clip_emb[0].shape[0]}")
-
-    # GloVe (optional, might not be downloaded)
-    try:
-        glove_embedder = GloVeEmbedder()
-        glove_emb = glove_embedder.get_class_embeddings(test_classes)
-        print(f"✓ GloVe embeddings: {len(glove_emb)} classes, dim={glove_emb[0].shape[0]}")
-
-        print(f"  CLIP/{len(clip_emb)} vs GloVe/{len(glove_emb)} classes available for comparison")
-
-    except Exception as e:
-        print(f"⚠ GloVe not available (this is OK): {e}")
-
-    return True
-
-
 def test_embedding_manager():
     """Test the unified EmbeddingManager"""
     print("\n" + "=" * 70)
@@ -106,7 +74,12 @@ def test_embedding_manager():
     if not config_path.exists():
         print("⚠ Config file not found, using defaults")
         config = {
-            "embeddings": {"type": "clip", "clip_model": "openai/clip-vit-base-patch32", "clip_cache_dir": "./cache/clip", "normalize": True, "glove_path": "glove.6B.300d.txt", "glove_dim": 300},
+            "embeddings": {
+                "type": "clip",
+                "clip_model": "openai/clip-vit-large-patch14",
+                "clip_cache_dir": "./cache/clip",
+                "normalize": True,
+            },
             "experiment": {"device": "cuda" if torch.cuda.is_available() else "cpu"},
             "paths": {"cache_dir": "./cache"},
         }
@@ -158,7 +131,13 @@ def test_embedding_quality():
     similar_pairs = [("cat", "dog"), ("airplane", "rocket"), ("car", "truck"), ("apple", "orange"), ("tree", "forest")]
 
     # Dissimilar classes should have low similarity
-    dissimilar_pairs = [("cat", "airplane"), ("dog", "clock"), ("tree", "television"), ("apple", "keyboard"), ("car", "butterfly")]
+    dissimilar_pairs = [
+        ("cat", "airplane"),
+        ("dog", "clock"),
+        ("tree", "television"),
+        ("apple", "keyboard"),
+        ("car", "butterfly"),
+    ]
 
     def compute_similarity(text1, text2):
         emb = embedder.encode_text([text1, text2])
@@ -214,12 +193,6 @@ def run_all_tests():
         results["cifar100"] = False
 
     try:
-        results["comparison"] = test_glove_comparison()
-    except Exception as e:
-        print(f"✗ Test 3 failed: {e}")
-        results["comparison"] = False
-
-    try:
         results["manager"] = test_embedding_manager()
     except Exception as e:
         print(f"✗ Test 4 failed: {e}")
@@ -248,9 +221,8 @@ def run_all_tests():
     if passed == total:
         print("\n🎉 All tests passed! CLIP embeddings are ready to use.")
         print("\nNext steps:")
-        print("  1. Integrate into your GAN training (update Generator/Discriminator)")
-        print("  2. Compare GAN training with CLIP vs GloVe")
-        print("  3. Evaluate ZSL performance improvement")
+        print("  1. Run the full pipeline: python -m src.main")
+        print("  2. Evaluate ZSL/GZSL performance improvement")
     else:
         print("\n⚠ Some tests failed. Please fix before proceeding.")
 

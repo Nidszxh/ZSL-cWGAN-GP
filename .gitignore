@@ -7,6 +7,13 @@ __pycache__/
 env/
 venv/
 *.egg-info/
+*.log
+
+# Tool caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
 
 # Data
 data/
@@ -21,6 +28,8 @@ logs/
 *.pth
 *.png
 *.jpg
+runs/*
+!runs/.gitkeep
 
 # IDEs
 .vscode/
@@ -35,7 +44,3 @@ Thumbs.db
 
 # Jupyter
 .ipynb_checkpoints/
-
-# Large files
-glove.6B.zip
-*.zip

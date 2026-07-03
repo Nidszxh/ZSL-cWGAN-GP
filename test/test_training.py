@@ -17,9 +17,8 @@ import torchvision.utils as vutils
 from src.models.generator import Generator
 from src.models.discriminator import Discriminator
 from src.utils.embeddings import EmbeddingManager
-from src.utils.data_loader import get_class_split, get_data_loaders
+from src.utils.data_loader import get_class_names, get_class_split, get_data_loaders
 from src.training.losses import WGANGPLoss
-from torchvision import datasets
 
 
 def quick_train_test(num_epochs=5):
@@ -43,6 +42,10 @@ def quick_train_test(num_epochs=5):
     config["training"]["mixed_precision"] = False
     config["training"]["use_ema"] = False
 
+    # Determinism: WGAN at aggressive TTUR is seed-sensitive.
+    torch.manual_seed(config["experiment"]["seed"])
+    torch.cuda.manual_seed_all(config["experiment"]["seed"])
+
     device = torch.device(config["experiment"]["device"])
     print(f"Device: {device}\n")
 
@@ -57,16 +60,16 @@ def quick_train_test(num_epochs=5):
     train_loader, val_loader, class_info = get_data_loaders(config, seen_classes)
     num_seen_classes = class_info["num_seen_classes"]
 
-    cifar100 = datasets.CIFAR100(root=config["paths"]["data_root"], download=True)
-    class_names = cifar100.classes
+    class_names = get_class_names(config["paths"]["data_root"])
 
     print(f"Data loaded: {len(train_loader)} batches\n")
 
     print("Step 2: Loading semantic embeddings...")
     embedding_manager = EmbeddingManager(config)
 
-    all_embeddings, embedding_dim = embedding_manager.get_embeddings(class_names)
-    seen_embeddings, _ = embedding_manager.get_embeddings(class_names, seen_classes)
+    seen_embeddings, embedding_dim = embedding_manager.get_embeddings(class_names, seen_classes)
+    del embedding_manager
+    torch.cuda.empty_cache()
 
     print(f"CLIP embeddings loaded, dim={embedding_dim}\n")
 
@@ -98,8 +101,16 @@ def quick_train_test(num_epochs=5):
 
     print("Step 4: Setting up optimization...")
 
-    optimizerD = optim.Adam(netD.parameters(), lr=config["training"]["lr_d"], betas=(config["training"]["beta1"], config["training"]["beta2"]))
-    optimizerG = optim.Adam(netG.parameters(), lr=config["training"]["lr_g"], betas=(config["training"]["beta1"], config["training"]["beta2"]))
+    optimizerD = optim.Adam(
+        netD.parameters(),
+        lr=config["training"]["lr_d"],
+        betas=(config["training"]["beta1"], config["training"]["beta2"]),
+    )
+    optimizerG = optim.Adam(
+        netG.parameters(),
+        lr=config["training"]["lr_g"],
+        betas=(config["training"]["beta1"], config["training"]["beta2"]),
+    )
 
     loss_fn = WGANGPLoss(lambda_gp=config["training"]["lambda_gp"])
 
@@ -126,8 +137,8 @@ def quick_train_test(num_epochs=5):
         batches = 0
 
         for real_images, labels in pbar:
-            real_images = real_images.to(device)
-            labels = labels.to(device)
+            real_images = real_images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
             batch_size = real_images.size(0)
             batches += 1
 
@@ -137,7 +148,9 @@ def quick_train_test(num_epochs=5):
                 z = torch.randn(batch_size, nz, device=device)
                 fake_images = netG(z, labels, seen_embeddings)
 
-                d_loss_dict = loss_fn.discriminator_loss(netD, real_images, fake_images, labels, seen_embeddings, device)
+                d_loss_dict = loss_fn.discriminator_loss(
+                    netD, real_images, fake_images, labels, seen_embeddings, device
+                )
 
                 d_loss_dict["d_loss"].backward()
                 torch.nn.utils.clip_grad_norm_(netD.parameters(), config["training"]["grad_clip"])
@@ -160,7 +173,13 @@ def quick_train_test(num_epochs=5):
             g_losses.append(g_loss_dict["g_loss"].item())
             d_losses.append(d_loss_dict["d_loss"].item())
 
-            pbar.set_postfix({"G": f"{epoch_g_loss/batches:.4f}", "D": f"{epoch_d_loss/batches:.4f}", "W": f"{d_loss_dict['wasserstein_distance']:.4f}"})
+            pbar.set_postfix(
+                {
+                    "G": f"{epoch_g_loss/batches:.4f}",
+                    "D": f"{epoch_d_loss/batches:.4f}",
+                    "W": f"{d_loss_dict['wasserstein_distance']:.4f}",
+                }
+            )
 
         if (epoch + 1) % 2 == 0 or epoch == 0:
             netG.eval()

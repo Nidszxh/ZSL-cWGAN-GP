@@ -9,15 +9,14 @@ import numpy as np
 import torch
 import torchvision.utils as vutils
 import yaml
-from torchvision import datasets
 
-from src.evaluation.gan_eval import compute_fid, save_fake_images, save_real_images
+from src.evaluation.gan_eval import compute_fid, save_fake_images, save_real_images, _save_images_concurrent
 from src.evaluation.gzsl_eval import evaluate_gzsl, plot_gzsl_results, train_gzsl_classifier
 from src.evaluation.zsl_eval import evaluate_zsl, train_zsl_classifier
 from src.models.discriminator import Discriminator
 from src.models.generator import Generator
 from src.training.trainer import train_gan
-from src.utils.data_loader import get_class_split, get_data_loaders, get_test_loader
+from src.utils.data_loader import get_class_names, get_class_split, get_data_loaders, get_test_loader
 from src.utils.embeddings import EmbeddingManager
 from src.utils.visualization import (
     create_experiment_summary,
@@ -45,7 +44,7 @@ def validate_config(config: dict) -> None:
     """Validate required config keys exist with sensible values."""
     required_paths = {
         "paths": ["data_root", "results_dir", "checkpoints_dir", "cache_dir"],
-        "dataset": ["num_classes", "seen_classes", "unseen_classes"],
+        "dataset": ["num_classes", "seen_classes"],
         "embeddings": ["type"],
         "model.generator": ["nz", "ngf", "nc", "semantic_proj_dim"],
         "model.discriminator": ["ndf", "nc", "semantic_proj_dim"],
@@ -66,9 +65,10 @@ def validate_config(config: dict) -> None:
                 errors.append(f"Missing config key: {section}.{key}")
 
     embed_type = config.get("embeddings", {}).get("type", "")
-    if embed_type in ("clip", "clip_ensemble"):
-        if not config.get("embeddings", {}).get("clip_model"):
-            errors.append("embeddings.clip_model required for clip/clip_ensemble")
+    if embed_type != "clip":
+        errors.append(f"embeddings.type must be 'clip', got {embed_type!r}")
+    elif not config.get("embeddings", {}).get("clip_model"):
+        errors.append("embeddings.clip_model required")
 
     if errors:
         for e in errors:
@@ -78,10 +78,13 @@ def validate_config(config: dict) -> None:
 
 def parse_args():
     parser = argparse.ArgumentParser(description="ZSL-cWGAN-GP Training")
-    parser.add_argument("--resume", type=str, default=None,
-                        help="Resume from checkpoint path (e.g. checkpoints/checkpoint_epoch_050.pth)")
-    parser.add_argument("--config", type=str, default="src/configs/config.yaml",
-                        help="Path to config file")
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Resume from checkpoint path (e.g. checkpoints/checkpoint_epoch_050.pth)",
+    )
+    parser.add_argument("--config", type=str, default="src/configs/config.yaml", help="Path to config file")
     return parser.parse_args()
 
 
@@ -106,7 +109,6 @@ def main():
         config["paths"]["results_dir"],
         config["paths"]["checkpoints_dir"],
         config["paths"]["cache_dir"],
-        f"{config['paths']['results_dir']}/fake",
         f"{config['paths']['results_dir']}/real",
         f"{config['paths']['results_dir']}/unseen_synthetic",
     ]:
@@ -119,19 +121,23 @@ def main():
         cache_dir=config["paths"]["cache_dir"],
         seed=config["experiment"]["seed"],
     )
+    # L1-F13: class arrays must be sorted to match FilteredCIFAR100's sorted-rank labels.
+    assert np.array_equal(np.sort(seen_classes), seen_classes)
+    assert np.array_equal(np.sort(unseen_classes), unseen_classes)
 
     train_loader, val_loader, class_info = get_data_loaders(config, seen_classes)
     num_seen_classes = class_info["num_seen_classes"]
 
-    cifar100 = datasets.CIFAR100(root=config["paths"]["data_root"], download=True)
-    class_names = cifar100.classes
+    class_names = get_class_names(config["paths"]["data_root"])
 
     # Embeddings
     print("\nLoading embeddings...")
     embedding_manager = EmbeddingManager(config)
-    all_embeddings, embedding_dim = embedding_manager.get_embeddings(class_names)
-    seen_embeddings, _ = embedding_manager.get_embeddings(class_names, seen_classes)
+    seen_embeddings, embedding_dim = embedding_manager.get_embeddings(class_names, seen_classes)
     unseen_embeddings, _ = embedding_manager.get_embeddings(class_names, unseen_classes)
+    # L2-F1b: free the CLIP encoder (~1.5GB) before GAN training.
+    del embedding_manager
+    torch.cuda.empty_cache()
     seen_embeddings = seen_embeddings.to(device)
     unseen_embeddings = unseen_embeddings.to(device)
 
@@ -163,13 +169,24 @@ def main():
     # Save real images once
     real_images_dir = f"{config['paths']['results_dir']}/real"
     if not Path(real_images_dir, "real_00000.png").exists():
-        save_real_images(val_loader.dataset, save_dir=real_images_dir)
+        save_real_images(
+            val_loader.dataset,
+            num_samples=config["evaluation"]["fid_samples"],
+            save_dir=real_images_dir,
+        )
 
     # Train (with optional resume)
     tracker = train_gan(
-        netG, netD, train_loader, seen_embeddings, device, config, real_images_dir,
+        netG,
+        netD,
+        train_loader,
+        seen_embeddings,
+        device,
+        config,
+        real_images_dir,
         resume_path=config.get("resume_path"),
     )
+    torch.cuda.empty_cache()
 
     # Post-training plots
     print("\nGenerating training visualizations...")
@@ -178,9 +195,7 @@ def main():
 
     # Load best model
     print(f"\nLoading best model with FID: {tracker.best_fid:.2f}")
-    checkpoint = torch.load(
-        Path(config["paths"]["checkpoints_dir"]) / "best_model.pth", weights_only=False
-    )
+    checkpoint = torch.load(Path(config["paths"]["checkpoints_dir"]) / "best_model.pth", weights_only=True)
     netG.load_state_dict(checkpoint["generator"])
     netD.load_state_dict(checkpoint["discriminator"])
 
@@ -198,6 +213,8 @@ def main():
         save_dir=f"{config['paths']['results_dir']}/fake_final",
     )
     final_metrics = compute_fid(real_images_dir, final_fake_dir)
+    # L2-F1: free Inception caches before the ZSL/GZSL phases (8GB VRAM).
+    torch.cuda.empty_cache()
     print(
         f"Final FID: {final_metrics['fid']:.2f} | IS: {final_metrics['is_mean']:.2f} +- {final_metrics['is_std']:.2f}"
     )
@@ -230,8 +247,7 @@ def main():
             class_dir = save_dir / f"{i:02d}_{class_names[unseen_class_idx]}"
             class_dir.mkdir(parents=True, exist_ok=True)
 
-            for j, img in enumerate(fake_imgs):
-                vutils.save_image(img, class_dir / f"{j:04d}.png")
+            _save_images_concurrent(fake_imgs, class_dir, lambda j: f"{j:04d}.png")
             if samples_per_class >= 16:
                 grid = vutils.make_grid(fake_imgs[:16], nrow=4, padding=2, normalize=False)
                 vutils.save_image(grid, class_dir / "samples_grid.png")
@@ -244,16 +260,13 @@ def main():
     print("=" * 70)
 
     test_loader, _ = get_test_loader(config, unseen_classes)
-    classifier = train_zsl_classifier(
-        netG, unseen_embeddings, unseen_classes, device, config
-    )
+    classifier = train_zsl_classifier(netG, unseen_embeddings, unseen_classes, device, config)
     zsl_metrics = evaluate_zsl(
         classifier,
         test_loader,
         unseen_classes,
         class_names,
         device,
-        results_dir=config["paths"]["results_dir"],
     )
 
     plot_zsl_confusion_matrix(zsl_metrics, save_dir=config["paths"]["results_dir"])
@@ -272,7 +285,6 @@ def main():
 
         gzsl_classifier = train_gzsl_classifier(
             generator=netG,
-            seen_semantic_embeddings=seen_embeddings,
             unseen_semantic_embeddings=unseen_embeddings,
             seen_classes=seen_classes,
             unseen_classes=unseen_classes,
@@ -290,7 +302,6 @@ def main():
                 seen_eval_loader=val_loader,
                 class_names=class_names,
                 device=device,
-                results_dir=config["paths"]["results_dir"],
             )
             plot_gzsl_results(gzsl_metrics, save_dir=config["paths"]["results_dir"])
 

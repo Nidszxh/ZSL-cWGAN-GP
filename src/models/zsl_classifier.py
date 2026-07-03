@@ -7,7 +7,6 @@ Supports:
 - Custom lightweight CNN (original, for reference)
 """
 
-import torch
 import torch.nn as nn
 import torchvision.models as models
 
@@ -33,7 +32,6 @@ class ZSLClassifier(nn.Module):
         hidden_dim: int = 512,
     ):
         super().__init__()
-        self.backbone_name = backbone
         self.num_classes = num_classes
 
         if backbone == "resnet18":

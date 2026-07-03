@@ -6,13 +6,11 @@ numpy>=1.24.0
 # Training and evaluation
 tqdm>=4.65.0
 torch-fidelity>=0.3.0
-scikit-learn>=1.2.0
 
 # Visualization
 matplotlib>=3.7.0
 
 # Data and utilities
-requests>=2.31.0
 Pillow>=9.5.0
 
 # CLIP text embeddings (via HuggingFace transformers)
@@ -26,6 +24,3 @@ pyyaml>=6.0
 
 # Web demo
 gradio>=4.0.0
-
-# Code quality (optional, dev-only)
-pytest>=7.3.0
